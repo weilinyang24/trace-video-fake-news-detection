@@ -15,6 +15,8 @@ from agentvideommd.io import write_jsonl
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build test-only manifests from copied VideoMMD splits.")
     parser.add_argument("--dataset", choices=("fakett", "fakesv", "all"), default="all")
+    parser.add_argument("--few-shot-seed", type=int, default=2025)
+    parser.add_argument("--no-few-shot", action="store_true")
     return parser.parse_args()
 
 
@@ -26,6 +28,10 @@ def main() -> None:
             dataset=dataset,
             annotation_path=REPO_ROOT / "data" / "annotations" / f"{dataset}.jsonl",
             split_path=REPO_ROOT / "data" / "splits" / dataset / "test.txt",
+            train_split_path=None
+            if args.no_few_shot
+            else REPO_ROOT / "data" / "splits" / dataset / "train.txt",
+            few_shot_seed=args.few_shot_seed,
         )
         output = REPO_ROOT / "data" / "manifests" / f"{dataset}_test.jsonl"
         count = write_jsonl(output, rows)
@@ -35,4 +41,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

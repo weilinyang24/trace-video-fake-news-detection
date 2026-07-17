@@ -1,0 +1,3 @@
+{"video_id": "train_real", "annotation": "real", "event": "Real training claim", "description": "real caption", "user_description": "real user", "publish_time": 1700000000000}
+{"video_id": "train_fake", "annotation": "fake", "event": "Fake training claim", "description": "fake caption", "user_description": "fake user", "publish_time": 1700000000000}
+{"video_id": "test_real", "annotation": "real", "event": "Current test claim", "description": "test caption", "user_description": "test user", "publish_time": 1700000000000}

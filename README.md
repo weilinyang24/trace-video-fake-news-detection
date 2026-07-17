@@ -1,69 +1,86 @@
 # AgentVideoMMD
 
-InternVideo3-8B-Instruct 在短视频虚假新闻检测任务上的直接推理基线。当前流程只评测固定测试集，不训练、不读取验证集调参，也不启用搜索、ASR 等 agent 工具。
+Direct Qwen3-VL-30B-Instruct inference for short-video fake-news detection on the copied VideoMMD FakeTT and FakeSV splits.
 
-## 评测口径
+The project does not use Swift and does not link back to the old `videommd` project. Annotations, splits, and generated manifests are regular local copies under `data/`.
 
-- 数据集与 `D:\MMdetection\videommd` 相同：FakeTT、FakeSV。
-- `data/splits/` 是原项目 train/val/test 时间划分的独立副本，不是链接。
-- FakeSV 延续原项目二分类策略：`真 -> real`、`假 -> fake`、`辟谣 -> 丢弃`。
-- 指标与原项目一致：accuracy、macro precision、macro recall、macro F1；无法解析的回答按 `fake` 计。
-- 提示词延续原项目的新闻真实性定义，强调本任务不是 deepfake 检测，并要求只输出 `real` 或 `fake`。
-
-## 准备数据
-
-仓库已经包含原始标注与划分的独立副本。重新生成测试 manifest：
-
-```bash
-python scripts/prepare_test_data.py --dataset all
-```
-
-预期规模：FakeTT 测试集 299 条；FakeSV 原测试划分 720 条，丢弃“辟谣”类后得到二分类测试子集。
-
-## 环境与检查
+## Environment
 
 ```bash
 pip install -e .
-python scripts/run_direct_inference.py \
-  --config configs/internvideo3/fakett.yaml \
-  --video-root /your/FakeTT/video \
-  --validate-only
 ```
 
-官方 InternVideo3 代码要求 `transformers>=4.57.3`。当前实验使用服务器本地模型目录 `/data2/573ops_ser/models/InternVL-8B`，默认采用 bfloat16、FlashAttention 2 和 `device_map=auto`。
+The default configs load `/data2/573ops_ser/models/Qwen3-VL-30B-Instruct` with `bfloat16`, `flash_attention_2`, and `device_map: auto`.
 
-Transformers 中 FlashAttention 2 的合法名称是 `flash_attention_2`，不是 `flash_attn`。如果环境没有安装 FlashAttention，可将 YAML 中的 `attn_implementation` 改为 `eager`，以较慢速度兼容运行。
+## Data
 
-本地模型包含 InternVL 自定义 remote code，因此加载权重时使用兼容 Transformers v4 的 `torch_dtype` 参数；不要直接改成新版 `dtype` 参数。
+- `data/annotations/` contains copied dataset annotations.
+- `data/splits/` contains copied train/val/test split files.
+- `data/manifests/` contains regenerated test manifests used by inference.
+- FakeTT test: 299 samples, real 200, fake 99.
+- FakeSV test: 542 binary samples after dropping the debunked class, real 238, fake 304.
 
-InternVL 自定义 `generate()` 会在内部启用 KV cache，因此推理配置不再额外传递 `use_cache`，以免向底层语言模型重复传参。
+Regenerate manifests with fixed train-set few-shot examples:
 
-## 只测试测试集
+```bash
+python scripts/prepare_test_data.py --dataset all --few-shot-seed 2025
+```
 
-FakeTT：
+Current fixed examples:
+
+- FakeTT real: `7217585276510620970`
+- FakeTT fake: `6885520369231334662`
+- FakeSV real: `6958356118821244190`
+- FakeSV fake: `6882551291101465856`
+
+Use `--no-few-shot` only for ablations.
+
+## Prompt
+
+Each test prompt contains:
+
+- A balanced veracity instruction.
+- One real and one fake text-only calibration example sampled from the train split.
+- The current sample auxiliary observations.
+
+The calibration examples include their known labels and metadata text only. Their videos are not added to the model input, so each inference item still contains exactly one current video.
+
+## FakeTT
+
+Smoke test:
 
 ```bash
 python scripts/run_direct_inference.py \
-  --config configs/internvideo3/fakett.yaml \
+  --config configs/qwen3vl/fakett.yaml \
+  --video-root /data2/573ops_ser/data/FakeTT/FakeTT/video \
+  --limit 1
+```
+
+Full test:
+
+```bash
+python scripts/run_direct_inference.py \
+  --config configs/qwen3vl/fakett.yaml \
   --video-root /data2/573ops_ser/data/FakeTT/FakeTT/video
 ```
 
-FakeSV：
+Outputs:
+
+- `outputs/qwen3_vl_30b_fewshot/fakett_test_predictions.jsonl`
+- `outputs/qwen3_vl_30b_fewshot/fakett_test_metrics.json`
+
+## FakeSV
 
 ```bash
 python scripts/run_direct_inference.py \
-  --config configs/internvideo3/fakesv.yaml \
+  --config configs/qwen3vl/fakesv.yaml \
   --video-root /data2/573ops_ser/data/FakeSV/video
 ```
 
-推理结果逐条追加写入 `outputs/internvideo3/*_predictions.jsonl`，中断后重复命令会按样本 ID 续跑；失败样本默认自动重试，不会被当作有效预测。若全部样本失败，程序会拒绝生成指标。指标写入对应的 `*_metrics.json`。
+Outputs are written under `outputs/qwen3_vl_30b_fewshot/`.
 
-只重新计算指标：
+## Video Input
 
-```bash
-python scripts/evaluate_predictions.py \
-  --predictions outputs/internvideo3/fakett_test_predictions.jsonl \
-  --output outputs/internvideo3/fakett_test_metrics.json
-```
+Videos are decoded with Transformers `load_video(..., backend="decord")`, using a safe fps sampler that caps requested frames at the actual frame count for very short videos. Bad videos follow the same fallback style used in the previous VideoMMD project: primary loader, `ffmpeg` thumbnail fallback, then 224x224 black placeholder frames if both loaders fail. The decoded video object is then passed through the Qwen3-VL `AutoProcessor.apply_chat_template` video path.
 
-首次正式全量运行前，建议先加 `--limit 2` 做显存和视频解码冒烟测试。`fps`、像素范围、生成长度和随机种子均固定在 YAML 中，实验报告应保存所用配置和模型 revision。
+The runner checks that video tensors are actually produced. It also uses strict metrics: if any latest prediction record has an inference error or cannot be parsed as `real`/`fake`, metrics are refused until the invalid IDs are rerun.

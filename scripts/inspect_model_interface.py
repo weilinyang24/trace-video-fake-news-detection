@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
+import torch  # Load libtorch before Transformers/NumPy integrations to avoid MKL loader conflicts.
 from transformers import AutoConfig, AutoProcessor
 
 
@@ -14,6 +15,7 @@ def main() -> None:
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
     result = {
+        "torch_version": torch.__version__,
         "config_class": type(config).__name__,
         "model_type": getattr(config, "model_type", None),
         "architectures": getattr(config, "architectures", None),

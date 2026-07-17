@@ -1,0 +1,29 @@
+model:
+  path: /data2/573ops_ser/models/Qwen3-VL-30B-Instruct
+  backend: qwen3_vl
+  dtype: bfloat16
+  attn_implementation: flash_attention_2
+  device_map: auto
+  trust_remote_code: true
+dataset:
+  name: fakesv
+  manifest: data/manifests/fakesv_test.jsonl
+  video_root: /data2/573ops_ser/data/FakeSV/video
+video:
+  fps: 2
+  decoder_backend: decord
+  fallback_num_frames: 16
+  min_visual_tokens: 256
+  max_visual_tokens: 16384
+  spatial_compression: 32
+  temporal_compression: 2
+generation:
+  max_new_tokens: 1
+  do_sample: false
+  use_cache: true
+  seed: 2025
+output:
+  predictions: outputs/qwen3_vl_30b_fewshot/fakesv_test_predictions.jsonl
+  metrics: outputs/qwen3_vl_30b_fewshot/fakesv_test_metrics.json
+runtime:
+  max_consecutive_errors: 3

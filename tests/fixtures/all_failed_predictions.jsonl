@@ -1,1 +1,2 @@
 {"id":"x","label":"real","prediction":"fake","parse_ok":false,"error":"boom"}
+{"id":"y","label":"fake","prediction":"fake","parse_ok":false,"error":null}

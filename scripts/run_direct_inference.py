@@ -12,9 +12,14 @@ from agentvideommd.runner import run
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Direct test-set inference with InternVideo3-8B-Instruct.")
+    parser = argparse.ArgumentParser(description="Direct test-set inference with Qwen3-VL-Instruct.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--video-root", type=Path, default=None)
+    parser.add_argument(
+        "--model-path",
+        default=None,
+        help="Qwen3-VL-Instruct Hugging Face ID or complete local snapshot directory.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--retry-errors", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -28,6 +33,7 @@ def main() -> None:
         config_path=args.config,
         repo_root=REPO_ROOT,
         video_root_override=args.video_root,
+        model_path_override=args.model_path,
         limit=args.limit,
         retry_errors=args.retry_errors,
         validate_only=args.validate_only,
@@ -38,4 +44,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
