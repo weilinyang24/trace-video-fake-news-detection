@@ -12,6 +12,20 @@ pip install -e .
 
 The default configs load `/data2/573ops_ser/models/Qwen3-VL-30B-Instruct` with `bfloat16`, `flash_attention_2`, and `device_map: auto`.
 
+Optional FlashAttention2 check:
+
+```bash
+python scripts/check_flash_attention.py --strict
+```
+
+If it is missing, install it in the active environment:
+
+```bash
+pip install -U packaging psutil ninja wheel setuptools -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120
+MAX_JOBS=8 pip install flash-attn --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120
+python scripts/check_flash_attention.py --strict
+```
+
 ## Data
 
 - `data/annotations/` contains copied dataset annotations.
@@ -78,6 +92,36 @@ python scripts/run_direct_inference.py \
 ```
 
 Outputs are written under `outputs/qwen3_vl_30b_fewshot/`.
+
+## Two-stage lightweight agent
+
+The direct baseline is fast but can be too weak because it asks the VLM to classify `real/fake` in one step. The two-stage runner keeps inference lightweight while adding a small agent-style decomposition:
+
+1. Qwen3-VL extracts structured visual/cross-modal evidence from the current video.
+2. Qwen3-8B judges `real/fake` from the extracted evidence, current auxiliary text, and dynamically retrieved train-set real/fake examples.
+
+Smoke test:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/run_two_stage_agent.py \
+  --config configs/qwen3vl/fakett.yaml \
+  --video-root /data2/573ops_ser/data/FakeTT/FakeTT/video \
+  --limit 5
+```
+
+Full test:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/run_two_stage_agent.py \
+  --config configs/qwen3vl/fakett.yaml \
+  --video-root /data2/573ops_ser/data/FakeTT/FakeTT/video \
+  --resume
+```
+
+Outputs:
+
+- `outputs/qwen3_vl_30b_twostage/fakett_test_predictions.jsonl`
+- `outputs/qwen3_vl_30b_twostage/fakett_test_metrics.json`
 
 ## Video Input
 

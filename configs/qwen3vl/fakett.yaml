@@ -5,6 +5,13 @@ model:
   attn_implementation: flash_attention_2
   device_map: auto
   trust_remote_code: true
+text_model:
+  path: /data2/573ops_ser/models/Qwen3-8B
+  backend: qwen3
+  dtype: bfloat16
+  attn_implementation: flash_attention_2
+  device_map: auto
+  trust_remote_code: true
 dataset:
   name: fakett
   manifest: data/manifests/fakett_test.jsonl
@@ -27,3 +34,10 @@ output:
   metrics: outputs/qwen3_vl_30b_fewshot/fakett_test_metrics.json
 runtime:
   max_consecutive_errors: 3
+two_stage:
+  retrieval_per_label: 2
+  max_video_frames: 64
+  visual_max_new_tokens: 768
+  judge_max_new_tokens: 384
+  predictions: outputs/qwen3_vl_30b_twostage/fakett_test_predictions.jsonl
+  metrics: outputs/qwen3_vl_30b_twostage/fakett_test_metrics.json
