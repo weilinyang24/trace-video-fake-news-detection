@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import random
 import re
+import hashlib
+import sqlite3
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +82,145 @@ def _strip_thinking(text: str) -> str:
     value = re.sub(r"<think>.*?</think>", "", value, flags=re.DOTALL | re.IGNORECASE)
     value = re.sub(r"^\s*<think>.*", "", value, flags=re.DOTALL | re.IGNORECASE)
     return value.strip()
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _video_file_fingerprint(path: Path) -> str:
+    if not path.exists():
+        return _sha256_text(f"missing:{path}")
+    stat = path.stat()
+    return _sha256_text(f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}")
+
+
+def _visual_cache_key(
+    *,
+    dataset: str,
+    sample_id: str,
+    video_path: Path,
+    model_path: str,
+    prompt: str,
+    max_video_frames: int,
+    visual_max_new_tokens: int,
+    schema_version: int,
+) -> tuple[str, dict[str, Any]]:
+    identity = {
+        "schema_version": schema_version,
+        "dataset": dataset,
+        "sample_id": sample_id,
+        "video": _video_file_fingerprint(video_path),
+        "model_path": model_path,
+        "prompt_hash": _sha256_text(prompt),
+        "max_video_frames": max_video_frames,
+        "visual_max_new_tokens": visual_max_new_tokens,
+    }
+    return _sha256_text(_canonical_json(identity)), identity
+
+
+class StageOneVisualCache:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path, timeout=60)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA busy_timeout=60000")
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stage1_visual_cache (
+                cache_key TEXT PRIMARY KEY,
+                dataset TEXT NOT NULL,
+                sample_id TEXT NOT NULL,
+                identity_json TEXT NOT NULL,
+                visual_json TEXT NOT NULL,
+                raw_text TEXT NOT NULL,
+                backend TEXT,
+                sampled_frames INTEGER,
+                source_total_frames INTEGER,
+                elapsed_seconds REAL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stage1_visual_cache_sample "
+            "ON stage1_visual_cache(dataset, sample_id)"
+        )
+        self.connection.commit()
+
+    def get(self, cache_key: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT visual_json, raw_text, backend, sampled_frames, source_total_frames, elapsed_seconds
+            FROM stage1_visual_cache WHERE cache_key = ?
+            """,
+            (cache_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "visual": json.loads(row[0]),
+            "raw_text": row[1],
+            "backend": row[2],
+            "sampled_frames": row[3],
+            "source_total_frames": row[4],
+            "elapsed_seconds": row[5],
+        }
+
+    def put(
+        self,
+        *,
+        cache_key: str,
+        identity: dict[str, Any],
+        visual: dict[str, Any],
+        raw_text: str,
+        backend: str,
+        sampled_frames: int,
+        source_total_frames: int | None,
+        elapsed_seconds: float,
+    ) -> None:
+        if "parse_error" in visual:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO stage1_visual_cache(
+                    cache_key, dataset, sample_id, identity_json, visual_json, raw_text,
+                    backend, sampled_frames, source_total_frames, elapsed_seconds,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    identity_json=excluded.identity_json,
+                    visual_json=excluded.visual_json,
+                    raw_text=excluded.raw_text,
+                    backend=excluded.backend,
+                    sampled_frames=excluded.sampled_frames,
+                    source_total_frames=excluded.source_total_frames,
+                    elapsed_seconds=excluded.elapsed_seconds,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    cache_key,
+                    str(identity["dataset"]),
+                    str(identity["sample_id"]),
+                    _canonical_json(identity),
+                    _canonical_json(visual),
+                    raw_text,
+                    backend,
+                    sampled_frames,
+                    source_total_frames,
+                    elapsed_seconds,
+                    now,
+                    now,
+                ),
+            )
 
 
 def _calibrate_prediction(judge: dict[str, Any]) -> dict[str, Any]:
@@ -348,8 +490,27 @@ def _load_dynamic_examples(
     return examples
 
 
-def _visual_prompt(row: dict[str, Any]) -> str:
+def _visual_prompt(row: dict[str, Any], dataset: str) -> str:
     current_context = _current_context(row)
+    if dataset.lower() == "fakesv":
+        return (
+            "你是中文短视频虚假新闻检测中的视觉证据提取器。\n"
+            "不要直接判断 real/fake，只提取当前视频和辅助文本中可以观察到的证据。\n"
+            "FakeSV 中 title 是主要待核查新闻声称；keywords、发布者信息、地点和评论只是辅助上下文，不是独立事实证明。\n"
+            "虚假新闻也可能使用真实画面，所以要区分：画面直接证明、字幕/旁白/评论重复声称、弱相关画面、以及画面与声称不匹配。\n\n"
+            "每个列表最多3项。不要输出Markdown、代码块或额外解释。只返回合法JSON，key必须使用英文：\n"
+            "{\n"
+            '  "claim_in_auxiliary_text": "string",\n'
+            '  "visible_scene_summary": "string",\n'
+            '  "visible_text_or_captions": ["string"],\n'
+            '  "visible_entities": ["string"],\n'
+            '  "video_claim_relation": "directly_shows_claim | narrates_or_repeats_claim | weakly_related | unrelated_or_mismatch | unclear",\n'
+            '  "possible_mismatch_cues": ["string"],\n'
+            '  "rumor_or_sensational_cues": ["string"],\n'
+            '  "ordinary_news_cues": ["string"]\n'
+            "}\n\n"
+            f"当前样本辅助文本：\n{current_context}"
+        )
     return (
         "You are a visual evidence extractor for short-video fake-news detection.\n"
         "Do NOT decide real/fake. Extract only what the current video and the provided auxiliary text show.\n"
@@ -393,6 +554,119 @@ def _judge_prompt(row: dict[str, Any], visual: dict[str, Any], examples: list[di
         f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
         f"current_auxiliary_prompt: {current_context}\n\n"
         f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+        "Do not output hidden reasoning or <think> blocks. Return exactly 4 lines in this format:\n"
+        "LABEL: real or fake\n"
+        "FAKE_SCORE: number_between_0_and_1\n"
+        "CONFIDENCE: number_between_0_and_1\n"
+        "REASON: one concise sentence"
+    )
+
+
+def _judge_review_prompt(
+    row: dict[str, Any],
+    visual: dict[str, Any],
+    examples: list[dict[str, Any]],
+    initial_judge: dict[str, Any],
+    retrieval_prior: dict[str, Any],
+    dataset: str,
+) -> str:
+    current_context = _current_context(row)
+    if dataset.lower() == "fakesv":
+        return (
+            "你是二阶段中文虚假新闻裁决的复核 Agent。\n"
+            "请检查初判是否犯了这些错误：过度相信画面/字幕重复、因为缺少完整证明而误判 fake、忽略训练集检索边界、"
+            "或没有发现当前视频中的画面-声称不匹配。\n\n"
+            "修正规则：\n"
+            "- 只有存在当前视频内部矛盾、无关/旧画面、伪造/谣言结构，或 fake 检索先验与当前谣言化线索一致时，才建议 real->fake。\n"
+            "- 如果 fake 的理由只是证据不完整、情绪化表达、评论质疑或不确定性，尤其检索偏 real 时，建议 fake->real。\n"
+            "- 如果证据混合，保持初判并降低信心。\n\n"
+            f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
+            f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
+            f"current_auxiliary_prompt: {current_context}\n\n"
+            f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+            f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
+            "只返回合法 JSON，key 必须使用英文：\n"
+            "{\n"
+            '  "needs_revision": true,\n'
+            '  "suggested_label": "real | fake | keep",\n'
+            '  "confidence_delta": -0.1,\n'
+            '  "review_reason": "一句中文理由",\n'
+            '  "risk_type": "overtrust_visual_repetition | weak_nonproof | retrieval_ignored | current_mismatch | none"\n'
+            "}"
+        )
+    return (
+        "You are a verifier agent for the second-stage fake-news judge.\n"
+        "Review the initial decision for dataset-calibrated short-video fake-news detection. "
+        "Do not use hidden reasoning. Focus on whether the initial judge over-trusted visual repetition, "
+        "over-penalized missing proof, or ignored retrieved training examples.\n\n"
+        "Correction policy:\n"
+        "- Recommend changing real->fake only for strong current evidence: claim-video contradiction, old/unrelated footage, hoax/fabrication, "
+        "or fake-leaning retrieval prior plus current rumor/sensational cues.\n"
+        "- Recommend changing fake->real when the only fake reason is weak visual non-proof, emotional wording, or uncertainty, "
+        "especially if retrieved examples favor real.\n"
+        "- If evidence is genuinely mixed, keep the initial label and lower confidence.\n\n"
+        f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
+        f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
+        f"current_auxiliary_prompt: {current_context}\n\n"
+        f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+        f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
+        "Return only valid JSON with this schema:\n"
+        "{\n"
+        '  "needs_revision": true,\n'
+        '  "suggested_label": "real | fake | keep",\n'
+        '  "confidence_delta": -0.1,\n'
+        '  "review_reason": "one concise sentence",\n'
+        '  "risk_type": "overtrust_visual_repetition | weak_nonproof | retrieval_ignored | current_mismatch | none"\n'
+        "}"
+    )
+
+
+def _judge_final_prompt(
+    row: dict[str, Any],
+    visual: dict[str, Any],
+    examples: list[dict[str, Any]],
+    initial_judge: dict[str, Any],
+    review: dict[str, Any],
+    retrieval_prior: dict[str, Any],
+    dataset: str,
+) -> str:
+    current_context = _current_context(row)
+    if dataset.lower() == "fakesv":
+        return (
+            "你是中文短视频虚假新闻检测二阶段 loop 的最终裁决器。\n"
+            "请综合初判和复核意见，输出最终 real/fake。检索样本用于校准数据集边界，但不是当前事件的事实证明。\n\n"
+            "最终规则：\n"
+            "- 只有复核指出具体当前视频证据或明确检索边界问题时，才改变初判。\n"
+            "- 不要因为抽样视频缺少完整证明就判 fake。\n"
+            "- 不要因为字幕、评论或画面重复异常声称就判 real。\n"
+            "- 证据混合时使用中等置信度。\n\n"
+            f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
+            f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
+            f"current_auxiliary_prompt: {current_context}\n\n"
+            f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+            f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
+            f"verifier_review_json: {json.dumps(review, ensure_ascii=False)}\n\n"
+            "不要输出思考过程或 <think>。严格输出4行，key必须使用英文：\n"
+            "LABEL: real or fake\n"
+            "FAKE_SCORE: number_between_0_and_1\n"
+            "CONFIDENCE: number_between_0_and_1\n"
+            "REASON: 用一句中文简要说明最终依据"
+        )
+    return (
+        "You are the final arbiter in a lightweight judge loop for short-video fake-news detection.\n"
+        "Use the initial decision and verifier review, but output your own final label. "
+        "Respect dataset-calibrated retrieved examples without treating them as factual proof.\n\n"
+        "Final arbitration rules:\n"
+        "- Change the initial label only when the verifier names a concrete current-video cue or a clear retrieval-boundary issue.\n"
+        "- Do not label fake merely because the sampled video lacks complete proof.\n"
+        "- Do not label real merely because captions or visuals repeat an extraordinary claim.\n"
+        "- Prefer moderate confidence when evidence is mixed.\n\n"
+        f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
+        f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
+        f"current_auxiliary_prompt: {current_context}\n\n"
+        f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+        f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
+        f"verifier_review_json: {json.dumps(review, ensure_ascii=False)}\n\n"
         "Do not output hidden reasoning or <think> blocks. Return exactly 4 lines in this format:\n"
         "LABEL: real or fake\n"
         "FAKE_SCORE: number_between_0_and_1\n"
@@ -592,9 +866,35 @@ def _calibrate_prediction(judge: dict[str, Any], retrieval_prior: dict[str, Any]
     return judge
 
 
-def _judge_prompt(row: dict[str, Any], visual: dict[str, Any], examples: list[dict[str, Any]]) -> str:
+def _judge_prompt(row: dict[str, Any], visual: dict[str, Any], examples: list[dict[str, Any]], dataset: str) -> str:
     current_context = _current_context(row)
     retrieval_prior = _retrieval_prior(examples, _current_claim_text(row))
+    if dataset.lower() == "fakesv":
+        return (
+            "你是中文短视频虚假新闻检测的校准裁决器。请判断当前样本在数据集中的标签：real 或 fake。\n\n"
+            "核心原则：\n"
+            "1. 这不是深度伪造检测。画面看起来真实，不代表新闻声称真实；真实旧视频配错标题也属于虚假新闻。\n"
+            "2. 在 FakeSV 中，title 是当前待核查新闻声称。keywords、发布者简介、地点和评论是辅助上下文，不是独立事实证明。\n"
+            "3. 不要因为抽样画面没有完整证明声称就直接判 fake；缺少直接视觉证明只是弱信号。\n"
+            "4. 字幕、旁白、标题或评论重复声称，不是独立证明。\n"
+            "5. 普通新闻、科普、实验、历史或公共事件内容，在没有当前视频内强反证时可以判 real。\n"
+            "6. 优先判 fake 的强证据包括：当前视频内部明确矛盾、画面与声称高置信不匹配、无关/旧画面冒充当前事件、伪造/谣言结构，"
+            "或声称中的关键身份、地点、原因、数量、速度等细节明显超出画面支持范围。\n"
+            "7. 营销语言、情绪化表达、争议性、评论区质疑或不完整演示本身不足以判 fake。\n\n"
+            "检索先验规则：\n"
+            "- retrieval_prior 来自训练集相似样本，是数据集边界校准线索，不是当前事件的外部事实证明。\n"
+            "- 如果检索和当前证据冲突且没有决定性观察，降低 CONFIDENCE，而不是编造证据。\n"
+            "- 不要按主题相似度机械复制训练样本标签。\n\n"
+            f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
+            f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
+            f"current_auxiliary_prompt: {current_context}\n\n"
+            f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+            "不要输出思考过程或 <think>。严格输出4行，key必须使用英文：\n"
+            "LABEL: real or fake\n"
+            "FAKE_SCORE: number_between_0_and_1\n"
+            "CONFIDENCE: number_between_0_and_1\n"
+            "REASON: 用一句中文简要说明决定性当前视频证据"
+        )
     return (
         "You are a calibrated judge for short-video fake-news detection.\n"
         "Classify whether the CURRENT video news item is real or fake for dataset evaluation.\n\n"
@@ -636,11 +936,15 @@ def run_two_stage(
     text_model_path_override: str | None = None,
     limit: int | None = None,
     resume: bool = False,
+    prediction_path_override: Path | None = None,
+    metrics_path_override: Path | None = None,
+    refresh_visual_cache_override: bool = False,
 ) -> dict[str, Any]:
     config = load_config(config_path)
     if text_model_path_override:
         config.setdefault("text_model", {})["path"] = text_model_path_override
     two_stage = config.get("two_stage", {})
+    dataset_name = str(config["dataset"]["name"]).lower()
     manifest_path = resolve_path(repo_root, config["dataset"]["manifest"])
     video_root = video_root_override or Path(config["dataset"]["video_root"])
     prediction_value = two_stage.get("predictions")
@@ -649,8 +953,8 @@ def run_two_stage(
     metrics_value = two_stage.get("metrics")
     if metrics_value is None:
         metrics_value = str(config["output"]["metrics"]).replace(".json", "_twostage.json")
-    prediction_path = resolve_path(repo_root, prediction_value)
-    metrics_path = resolve_path(repo_root, metrics_value)
+    prediction_path = prediction_path_override or resolve_path(repo_root, prediction_value)
+    metrics_path = metrics_path_override or resolve_path(repo_root, metrics_value)
     rows = list(read_jsonl(manifest_path))
     if limit is not None:
         rows = rows[:limit]
@@ -674,6 +978,20 @@ def run_two_stage(
     judge_tokens = int(two_stage.get("judge_max_new_tokens", 384))
     per_label = int(two_stage.get("retrieval_per_label", 2))
     max_video_frames = int(two_stage.get("max_video_frames", 64))
+    cache_config = two_stage.get("visual_cache", {})
+    visual_cache = (
+        StageOneVisualCache(resolve_path(repo_root, cache_config.get("path", "outputs/cache/stage1_visual.sqlite3")))
+        if bool(cache_config.get("enabled", True))
+        else None
+    )
+    cache_schema_version = int(cache_config.get("schema_version", 1))
+    refresh_visual_cache = bool(cache_config.get("refresh", False)) or refresh_visual_cache_override
+    loop_config = two_stage.get("judge_loop", {})
+    loop_enabled = bool(loop_config.get("enabled", True))
+    review_tokens = int(loop_config.get("review_max_new_tokens", 256))
+    final_tokens = int(loop_config.get("final_max_new_tokens", judge_tokens))
+    visual_cache_hits = 0
+    visual_cache_misses = 0
 
     with prediction_path.open("a", encoding="utf-8", newline="\n") as output:
         for index, row in enumerate(rows, 1):
@@ -683,53 +1001,97 @@ def run_two_stage(
             started = time.perf_counter()
             result = {"id": sample_id, "label": row["label"], "video": row["video"]}
             try:
-                video_frames, video_metadata, backend, decoder_errors = _load_video_frames(
-                    video_root / row["video"],
-                    fps,
-                    decoder_backend,
-                    fallback_num_frames,
+                video_path = video_root / row["video"]
+                visual_prompt = _visual_prompt(row, dataset_name)
+                cache_key, cache_identity = _visual_cache_key(
+                    dataset=dataset_name,
+                    sample_id=sample_id,
+                    video_path=video_path,
+                    model_path=str(config.get("model", {}).get("path", "")),
+                    prompt=visual_prompt,
+                    max_video_frames=max_video_frames,
+                    visual_max_new_tokens=visual_tokens,
+                    schema_version=cache_schema_version,
                 )
-                print(
-                    json.dumps(
-                        {
-                            "event": "decode_video",
-                            "video": row["video"],
-                            "backend": backend,
-                            "sampled_frames": len(video_frames),
-                            "total_frames": _metadata_value(video_metadata, "total_num_frames"),
-                            "fallback_errors": decoder_errors,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-                video_frames, model_video_metadata = _uniform_sample_video(video_frames, video_metadata, max_video_frames, fps)
-                print(
-                    json.dumps(
-                        {
-                            "event": "sample_video_for_model",
-                            "video": row["video"],
-                            "model_frames": len(video_frames),
-                            "source_total_frames": _metadata_value(model_video_metadata, "source_total_num_frames"),
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-                visual_raw = _generate_text_with_video(
-                    vlm,
-                    processor,
-                    video_frames,
-                    model_video_metadata,
-                    _visual_prompt(row),
-                    fps,
-                    max_new_tokens=visual_tokens,
-                    do_sample=False,
-                )
-                visual = _json_or_raw(visual_raw, "visual_raw_summary")
+                cached_visual = None if refresh_visual_cache or visual_cache is None else visual_cache.get(cache_key)
+                if cached_visual is not None:
+                    visual_cache_hits += 1
+                    visual = cached_visual["visual"]
+                    visual_raw = cached_visual["raw_text"]
+                    backend = cached_visual.get("backend")
+                    print(
+                        json.dumps(
+                            {
+                                "event": "stage1_visual_cache_hit",
+                                "id": sample_id,
+                                "video": row["video"],
+                                "cache_key": cache_key,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                else:
+                    visual_cache_misses += 1
+                    visual_started = time.perf_counter()
+                    video_frames, video_metadata, backend, decoder_errors = _load_video_frames(
+                        video_path,
+                        fps,
+                        decoder_backend,
+                        fallback_num_frames,
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "event": "decode_video",
+                                "video": row["video"],
+                                "backend": backend,
+                                "sampled_frames": len(video_frames),
+                                "total_frames": _metadata_value(video_metadata, "total_num_frames"),
+                                "fallback_errors": decoder_errors,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    video_frames, model_video_metadata = _uniform_sample_video(video_frames, video_metadata, max_video_frames, fps)
+                    print(
+                        json.dumps(
+                            {
+                                "event": "sample_video_for_model",
+                                "video": row["video"],
+                                "model_frames": len(video_frames),
+                                "source_total_frames": _metadata_value(model_video_metadata, "source_total_num_frames"),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    visual_raw = _generate_text_with_video(
+                        vlm,
+                        processor,
+                        video_frames,
+                        model_video_metadata,
+                        visual_prompt,
+                        fps,
+                        max_new_tokens=visual_tokens,
+                        do_sample=False,
+                    )
+                    visual = _json_or_raw(visual_raw, "visual_raw_summary")
+                    if visual_cache is not None:
+                        visual_cache.put(
+                            cache_key=cache_key,
+                            identity=cache_identity,
+                            visual=visual,
+                            raw_text=visual_raw,
+                            backend=str(backend),
+                            sampled_frames=len(video_frames),
+                            source_total_frames=_metadata_value(model_video_metadata, "source_total_num_frames"),
+                            elapsed_seconds=round(time.perf_counter() - visual_started, 4),
+                        )
                 examples = _load_dynamic_examples(
                     repo_root,
-                    str(config["dataset"]["name"]).lower(),
+                    dataset_name,
                     _current_context(row),
                     per_label=per_label,
                     seed=seed,
@@ -738,11 +1100,32 @@ def run_two_stage(
                 judge_raw = _generate_text_only(
                     text_model,
                     tokenizer,
-                    _judge_prompt(row, visual, examples),
+                    _judge_prompt(row, visual, examples, dataset_name),
                     max_new_tokens=judge_tokens,
                     do_sample=False,
                 )
-                judge = _calibrate_prediction(_judge_from_raw(judge_raw), retrieval_prior)
+                initial_judge = _calibrate_prediction(_judge_from_raw(judge_raw), retrieval_prior)
+                review_raw = ""
+                review = {}
+                final_raw = ""
+                judge = initial_judge
+                if loop_enabled:
+                    review_raw = _generate_text_only(
+                        text_model,
+                        tokenizer,
+                        _judge_review_prompt(row, visual, examples, initial_judge, retrieval_prior, dataset_name),
+                        max_new_tokens=review_tokens,
+                        do_sample=False,
+                    )
+                    review = _json_or_raw(review_raw, "review_raw_summary")
+                    final_raw = _generate_text_only(
+                        text_model,
+                        tokenizer,
+                        _judge_final_prompt(row, visual, examples, initial_judge, review, retrieval_prior, dataset_name),
+                        max_new_tokens=final_tokens,
+                        do_sample=False,
+                    )
+                    judge = _calibrate_prediction(_judge_from_raw(final_raw), retrieval_prior)
                 prediction, parse_ok = normalize_prediction(str(judge.get("prediction", "")))
                 result.update(
                     {
@@ -757,6 +1140,13 @@ def run_two_stage(
                         "retrieval_prior": retrieval_prior,
                         "visual_raw": visual_raw,
                         "judge_raw": judge_raw,
+                        "judge_loop_enabled": loop_enabled,
+                        "initial_judge": initial_judge,
+                        "review": review,
+                        "review_raw": review_raw,
+                        "final_judge_raw": final_raw,
+                        "visual_cache_hit": cached_visual is not None,
+                        "visual_cache_key": cache_key,
                         "error": None,
                     }
                 )
@@ -777,7 +1167,18 @@ def run_two_stage(
             print(json.dumps({"index": index, **{k: v for k, v in result.items() if k not in {"visual_evidence", "visual_raw", "judge_raw", "retrieved_examples"}}}, ensure_ascii=False), flush=True)
 
     if limit is not None:
-        return {"mode": "smoke_test", "requested": len(rows), "predictions": str(prediction_path), "metrics_written": False}
+        return {
+            "mode": "smoke_test",
+            "requested": len(rows),
+            "predictions": str(prediction_path),
+            "metrics_written": False,
+            "visual_cache_hits": visual_cache_hits,
+            "visual_cache_misses": visual_cache_misses,
+            "judge_loop_enabled": loop_enabled,
+        }
     metrics = evaluate_prediction_file(prediction_path)
+    metrics["visual_cache_hits"] = visual_cache_hits
+    metrics["visual_cache_misses"] = visual_cache_misses
+    metrics["judge_loop_enabled"] = loop_enabled
     write_json_atomic(metrics_path, metrics)
     return metrics

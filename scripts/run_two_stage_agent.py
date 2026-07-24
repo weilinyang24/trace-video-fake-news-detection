@@ -18,6 +18,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-model-path", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--predictions", type=Path, default=None)
+    parser.add_argument("--metrics", type=Path, default=None)
+    parser.add_argument("--refresh-visual-cache", action="store_true")
     return parser.parse_args()
 
 
@@ -30,6 +33,9 @@ def main() -> None:
         text_model_path_override=args.text_model_path,
         limit=args.limit,
         resume=args.resume,
+        prediction_path_override=args.predictions,
+        metrics_path_override=args.metrics,
+        refresh_visual_cache_override=args.refresh_visual_cache,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

@@ -15,7 +15,7 @@ text_model:
 dataset:
   name: fakesv
   manifest: data/manifests/fakesv_test.jsonl
-  video_root: /data2/573ops_ser/data/FakeSV/video
+  video_root: /data2/573ops_ser/data/FakeSV/video/videos
 video:
   fps: 2
   decoder_backend: decord
@@ -39,5 +39,14 @@ two_stage:
   max_video_frames: 64
   visual_max_new_tokens: 768
   judge_max_new_tokens: 384
+  visual_cache:
+    enabled: true
+    path: outputs/cache/stage1_visual.sqlite3
+    schema_version: 1
+    refresh: false
+  judge_loop:
+    enabled: true
+    review_max_new_tokens: 256
+    final_max_new_tokens: 384
   predictions: outputs/qwen3_vl_30b_twostage/fakesv_test_predictions.jsonl
   metrics: outputs/qwen3_vl_30b_twostage/fakesv_test_metrics.json
