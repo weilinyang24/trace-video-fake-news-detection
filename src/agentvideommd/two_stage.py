@@ -5,6 +5,9 @@ import random
 import re
 import hashlib
 import sqlite3
+import shutil
+import subprocess
+import tempfile
 import time
 import traceback
 from datetime import datetime, timezone
@@ -48,33 +51,6 @@ def _json_or_raw(text: str, fallback_key: str, error_key: str = "parse_error") -
             fallback_key: text[:4000],
             error_key: f"{type(exc).__name__}: {exc}",
         }
-
-
-def _judge_from_raw(text: str) -> dict[str, Any]:
-    text = _strip_thinking(text)
-    judge = _json_or_raw(text, "judge_raw_summary")
-    if "prediction" in judge:
-        return judge
-    label_match = re.search(r"^\s*(?:LABEL|PREDICTION)\s*[:：]\s*(real|fake)\b", text, flags=re.IGNORECASE | re.MULTILINE)
-    if label_match:
-        prediction, parse_ok = label_match.group(1).lower(), True
-    else:
-        prediction, parse_ok = normalize_prediction(text)
-    score_match = re.search(r"(?:FAKE_SCORE|fake_score|score)\s*[:：]?\s*([01](?:\.\d+)?)", text, flags=re.IGNORECASE)
-    fake_score = float(score_match.group(1)) if score_match else (0.5 if parse_ok else 0.5)
-    confidence_match = re.search(r"(?:CONFIDENCE|confidence)\s*[:：]?\s*([01](?:\.\d+)?)", text, flags=re.IGNORECASE)
-    confidence = float(confidence_match.group(1)) if confidence_match else (0.5 if parse_ok else 0.49)
-    reason_match = re.search(r"(?:REASON|reason)\s*[:：]\s*(.+)", text, flags=re.IGNORECASE | re.DOTALL)
-    reason = reason_match.group(1).strip() if reason_match else (text or "Empty judge output.")[:500]
-    return {
-        **judge,
-        "prediction": prediction if parse_ok else "fake",
-        "fake_score": fake_score,
-        "confidence": confidence,
-        "key_factors": ["parsed compact judge label format"],
-        "rationale": reason[:500],
-        "parse_fallback": True,
-    }
 
 
 def _strip_thinking(text: str) -> str:
@@ -223,54 +199,115 @@ class StageOneVisualCache:
             )
 
 
-def _calibrate_prediction(judge: dict[str, Any]) -> dict[str, Any]:
-    prediction = str(judge.get("prediction", "")).lower()
-    rationale = str(judge.get("rationale", ""))
-    factors = " ".join(str(item) for item in judge.get("key_factors", []))
-    text = f"{rationale} {factors}".lower()
-    weak_visual_only = any(
-        phrase in text
-        for phrase in [
-            "does not show",
-            "not show",
-            "not visible",
-            "not supported by visible",
-            "no direct visual",
-            "not directly shown",
-            "incomplete visual",
-        ]
-    )
-    strong_fake = any(
-        phrase in text
-        for phrase in [
-            "conspiracy",
-            "microchip",
-            "microchips",
-            "false context",
-            "unrelated footage",
-            "old footage",
-            "contradict",
-            "mismatch",
-            "fabricated",
-            "hoax",
-            "rumor",
-        ]
-    )
-    if prediction == "fake" and weak_visual_only and not strong_fake:
-        calibrated = dict(judge)
-        calibrated["prediction"] = "real"
-        calibrated["fake_score"] = min(float(judge.get("fake_score") or 0.5), 0.45)
-        calibrated["confidence"] = min(float(judge.get("confidence") or 0.5), 0.62)
-        calibrated["key_factors"] = [
-            *list(judge.get("key_factors", [])),
-            "calibrated: weak visual non-proof alone is insufficient for fake",
-        ]
-        calibrated["rationale"] = (
-            f"{rationale} Calibration changed the label to real because lack of direct visual proof alone "
-            "is not sufficient evidence of fake news."
-        ).strip()
-        return calibrated
-    return judge
+def _audio_cache_key(
+    *,
+    dataset: str,
+    sample_id: str,
+    video_path: Path,
+    model_path: str,
+    prompt: str,
+    audio_max_new_tokens: int,
+    schema_version: int,
+    sample_rate: int,
+) -> tuple[str, dict[str, Any]]:
+    identity = {
+        "schema_version": schema_version,
+        "dataset": dataset,
+        "sample_id": sample_id,
+        "video": _video_file_fingerprint(video_path),
+        "model_path": model_path,
+        "prompt_hash": _sha256_text(prompt),
+        "audio_max_new_tokens": audio_max_new_tokens,
+        "sample_rate": sample_rate,
+    }
+    return _sha256_text(_canonical_json(identity)), identity
+
+
+class AudioEvidenceCache:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path, timeout=60)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA busy_timeout=60000")
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audio_evidence_cache (
+                cache_key TEXT PRIMARY KEY,
+                dataset TEXT NOT NULL,
+                sample_id TEXT NOT NULL,
+                identity_json TEXT NOT NULL,
+                audio_json TEXT NOT NULL,
+                raw_text TEXT NOT NULL,
+                backend TEXT,
+                elapsed_seconds REAL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_evidence_cache_sample "
+            "ON audio_evidence_cache(dataset, sample_id)"
+        )
+        self.connection.commit()
+
+    def get(self, cache_key: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT audio_json, raw_text, backend, elapsed_seconds
+            FROM audio_evidence_cache WHERE cache_key = ?
+            """,
+            (cache_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "audio": json.loads(row[0]),
+            "raw_text": row[1],
+            "backend": row[2],
+            "elapsed_seconds": row[3],
+        }
+
+    def put(
+        self,
+        *,
+        cache_key: str,
+        identity: dict[str, Any],
+        audio: dict[str, Any],
+        raw_text: str,
+        backend: str,
+        elapsed_seconds: float,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO audio_evidence_cache(
+                    cache_key, dataset, sample_id, identity_json, audio_json, raw_text,
+                    backend, elapsed_seconds, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    identity_json=excluded.identity_json,
+                    audio_json=excluded.audio_json,
+                    raw_text=excluded.raw_text,
+                    backend=excluded.backend,
+                    elapsed_seconds=excluded.elapsed_seconds,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    cache_key,
+                    str(identity["dataset"]),
+                    str(identity["sample_id"]),
+                    _canonical_json(identity),
+                    _canonical_json(audio),
+                    raw_text,
+                    backend,
+                    elapsed_seconds,
+                    now,
+                    now,
+                ),
+            )
 
 
 def _generate_text_with_video(
@@ -411,6 +448,126 @@ def _generate_text_only(
     return _strip_thinking(tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip())
 
 
+def _load_audio_model(config: dict[str, Any]):
+    import torch
+    from transformers import AutoProcessor
+
+    try:
+        from transformers import Qwen2AudioForConditionalGeneration
+    except ImportError as exc:
+        raise RuntimeError(
+            "Current transformers does not expose Qwen2AudioForConditionalGeneration. "
+            "Please upgrade transformers or install a version that supports Qwen2-Audio."
+        ) from exc
+
+    audio_config = config.get("audio_model", {})
+    model_path = str(audio_config.get("path", "/data2/573ops_ser/models/Qwen2-Audio-7B-Instruct"))
+    attn_implementation = _normalize_attn_implementation(str(audio_config.get("attn_implementation", "sdpa")))
+    print(
+        json.dumps(
+            {
+                "event": "load_audio_model",
+                "model_path": model_path,
+                "attn_implementation": attn_implementation,
+                "dtype": audio_config.get("dtype", "bfloat16"),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    model_kwargs = {
+        "attn_implementation": attn_implementation,
+        "device_map": audio_config.get("device_map", "auto"),
+        "trust_remote_code": bool(audio_config.get("trust_remote_code", True)),
+    }
+    dtype = _torch_dtype(torch, audio_config.get("dtype", "bfloat16"))
+    try:
+        model = Qwen2AudioForConditionalGeneration.from_pretrained(
+            model_path,
+            dtype=dtype,
+            **model_kwargs,
+        ).eval()
+    except TypeError as exc:
+        if "dtype" not in str(exc):
+            raise
+        model = Qwen2AudioForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            **model_kwargs,
+        ).eval()
+    processor = AutoProcessor.from_pretrained(
+        model_path,
+        trust_remote_code=bool(audio_config.get("trust_remote_code", True)),
+    )
+    return model, processor
+
+
+def _extract_audio_wav(video_path: Path, output_path: Path, sample_rate: int) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg executable is not available; cannot extract audio")
+    command = [
+        ffmpeg,
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "wav",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or f"ffmpeg audio extraction failed for {video_path}")
+    if not output_path.exists() or output_path.stat().st_size <= 44:
+        raise RuntimeError(f"ffmpeg produced empty audio for {video_path}")
+
+
+def _generate_text_with_audio(
+    model: Any,
+    processor: Any,
+    wav_path: Path,
+    prompt: str,
+    max_new_tokens: int,
+    do_sample: bool = False,
+) -> str:
+    import torch
+
+    try:
+        import librosa
+    except Exception as exc:
+        raise RuntimeError("librosa is required for Qwen2-Audio inference; install librosa soundfile") from exc
+
+    sample_rate = int(getattr(getattr(processor, "feature_extractor", None), "sampling_rate", 16000) or 16000)
+    audio, _ = librosa.load(str(wav_path), sr=sample_rate, mono=True)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio_url": str(wav_path)},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=rendered, audios=[audio], return_tensors="pt", padding=True)
+    inputs = inputs.to(model.device)
+    generation = {"max_new_tokens": max_new_tokens, "do_sample": do_sample}
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        generation["pad_token_id"] = tokenizer.eos_token_id
+    with torch.inference_mode():
+        output_ids = model.generate(**inputs, **generation)
+    generated = output_ids[:, inputs.input_ids.shape[-1] :]
+    return _strip_thinking(processor.batch_decode(generated, skip_special_tokens=True)[0].strip())
+
+
 def _tokens(text: str) -> set[str]:
     lowered = text.lower()
     words = set(re.findall(r"[a-z0-9_#@]+", lowered))
@@ -531,40 +688,53 @@ def _visual_prompt(row: dict[str, Any], dataset: str) -> str:
     )
 
 
-def _judge_prompt(row: dict[str, Any], visual: dict[str, Any], examples: list[dict[str, Any]]) -> str:
+def _audio_prompt(row: dict[str, Any], dataset: str) -> str:
     current_context = _current_context(row)
+    if dataset.lower() == "fakesv":
+        return (
+            "你是中文短视频虚假新闻检测中的音频证据提取器。\n"
+            "请只分析音频中的旁白、说话内容、语气、背景声和可能的煽动性表达，不要直接判断 real/fake。\n"
+            "注意：旁白或字幕朗读 title 只是重复声称，不等于证明声称真实；情绪化语气只能作为弱线索。\n\n"
+            "只返回合法 JSON，key 必须使用英文：\n"
+            "{\n"
+            '  "audio_available": true,\n'
+            '  "speech_transcript": "string",\n'
+            '  "spoken_claims": ["string"],\n'
+            '  "speaker_style": "news_report | narration | interview | casual | dramatic | unknown",\n'
+            '  "emotion_tone": "neutral | urgent | angry | fearful | excited | sad | unknown",\n'
+            '  "rumor_or_sensational_audio_cues": ["string"],\n'
+            '  "audio_visual_consistency": "consistent | mismatch | audio_only_claim | unclear",\n'
+            '  "audio_title_consistency": "supports_title | contradicts_title | repeats_title_only | unrelated | unclear",\n'
+            '  "decision_relevance": "high | medium | low",\n'
+            '  "summary": "一句中文摘要"\n'
+            "}\n\n"
+            f"当前样本辅助文本：\n{current_context}"
+        )
     return (
-        "You are a calibrated judge for short-video fake-news detection.\n"
-        "Classify whether the CURRENT video news item is real or fake for dataset evaluation.\n\n"
-        "Important principles:\n"
-        "1. This is not deepfake detection. A visually authentic clip can still be fake news by false context or overclaim.\n"
-        "2. Do NOT mark fake merely because the video does not fully prove the claim. Lack of direct visual proof is only a weak signal.\n"
-        "3. Many real samples are ordinary news, science, experiment, explainer, or public-affairs posts with limited internal proof. "
-        "If such a claim is plausible and there is no clear contradiction, choose real.\n"
-        "4. Do not mark real merely because the video/caption repeats the claim. Fake videos can self-support their own story.\n"
-        "5. Prefer fake only for strong misinformation patterns: explicit claim-video contradiction, unrelated/old-footage false context, "
-        "clear conspiracy/rumor framing, fabricated extraordinary claim, or title/caption making a stronger claim than the video/text can support.\n"
-        "6. Marketing language, emotional wording, or incomplete visual demonstration alone is not enough for fake.\n"
-        "7. Use external common knowledge only for widely known false conspiracy claims (for example vaccine microchips), not for every uncertain claim.\n\n"
-        "Decision calibration:\n"
-        "- If evidence is weak/ambiguous and the claim is ordinary or plausible, output LABEL: real with moderate confidence.\n"
-        "- If the main reason is only 'not shown in the sampled frames', output LABEL: real unless there is another strong fake-news cue.\n"
-        "- If the claim is extraordinary, conspiratorial, or clearly mismatched with the video, output LABEL: fake.\n\n"
-        "Use the retrieved training examples only to calibrate the dataset boundary, not as factual evidence.\n"
-        f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
-        f"current_auxiliary_prompt: {current_context}\n\n"
-        f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
-        "Do not output hidden reasoning or <think> blocks. Return exactly 4 lines in this format:\n"
-        "LABEL: real or fake\n"
-        "FAKE_SCORE: number_between_0_and_1\n"
-        "CONFIDENCE: number_between_0_and_1\n"
-        "REASON: one concise sentence"
+        "You are an audio evidence extractor for short-video fake-news detection.\n"
+        "Analyze only speech, narration, tone, background sound, and sensational audio cues. Do NOT decide real/fake.\n"
+        "Important: narration repeating the title is not independent proof; emotional tone is only a weak cue.\n\n"
+        "Return only valid JSON with this schema:\n"
+        "{\n"
+        '  "audio_available": true,\n'
+        '  "speech_transcript": "string",\n'
+        '  "spoken_claims": ["string"],\n'
+        '  "speaker_style": "news_report | narration | interview | casual | dramatic | unknown",\n'
+        '  "emotion_tone": "neutral | urgent | angry | fearful | excited | sad | unknown",\n'
+        '  "rumor_or_sensational_audio_cues": ["string"],\n'
+        '  "audio_visual_consistency": "consistent | mismatch | audio_only_claim | unclear",\n'
+        '  "audio_title_consistency": "supports_title | contradicts_title | repeats_title_only | unrelated | unclear",\n'
+        '  "decision_relevance": "high | medium | low",\n'
+        '  "summary": "one concise sentence"\n'
+        "}\n\n"
+        f"Auxiliary text for the current sample:\n{current_context}"
     )
 
 
 def _judge_review_prompt(
     row: dict[str, Any],
     visual: dict[str, Any],
+    audio: dict[str, Any],
     examples: list[dict[str, Any]],
     initial_judge: dict[str, Any],
     retrieval_prior: dict[str, Any],
@@ -574,16 +744,19 @@ def _judge_review_prompt(
     if dataset.lower() == "fakesv":
         return (
             "你是二阶段中文虚假新闻裁决的复核 Agent。\n"
-            "请检查初判是否犯了这些错误：过度相信画面/字幕重复、因为缺少完整证明而误判 fake、忽略训练集检索边界、"
-            "或没有发现当前视频中的画面-声称不匹配。\n\n"
+            "你的默认任务是验证初判，而不是重新自由裁决。除非发现高置信错误，否则必须保持初判。\n\n"
             "修正规则：\n"
-            "- 只有存在当前视频内部矛盾、无关/旧画面、伪造/谣言结构，或 fake 检索先验与当前谣言化线索一致时，才建议 real->fake。\n"
-            "- 如果 fake 的理由只是证据不完整、情绪化表达、评论质疑或不确定性，尤其检索偏 real 时，建议 fake->real。\n"
-            "- 如果证据混合，保持初判并降低信心。\n\n"
+            "- 默认 suggested_label 必须是 keep。\n"
+            "- 只有当初判与 retrieval_prior 强冲突，且当前视觉/音频没有支持初判的强证据时，才建议改判。\n"
+            "- initial=fake 且 retrieval_prior=fake 时，禁止建议 fake->real，除非视频/音频明确直接证明新闻声称为真。\n"
+            "- initial=real 且 retrieval_prior=real 时，禁止建议 real->fake，除非存在明确当前视频内部矛盾、无关/旧画面、伪造/谣言结构。\n"
+            "- 不要因为“缺少完整证明”“情绪化表达”“评论质疑”“音频重复标题”建议改判。\n"
+            "- 如果证据混合、不确定、或只是弱线索，保持初判并降低信心。\n\n"
             f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
             f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
             f"current_auxiliary_prompt: {current_context}\n\n"
             f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+            f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
             f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
             "只返回合法 JSON，key 必须使用英文：\n"
             "{\n"
@@ -596,19 +769,20 @@ def _judge_review_prompt(
         )
     return (
         "You are a verifier agent for the second-stage fake-news judge.\n"
-        "Review the initial decision for dataset-calibrated short-video fake-news detection. "
-        "Do not use hidden reasoning. Focus on whether the initial judge over-trusted visual repetition, "
-        "over-penalized missing proof, or ignored retrieved training examples.\n\n"
+        "Your default job is to validate the initial decision, not to freely re-decide the label. "
+        "Recommend a label change only for high-confidence initial-judge errors.\n\n"
         "Correction policy:\n"
-        "- Recommend changing real->fake only for strong current evidence: claim-video contradiction, old/unrelated footage, hoax/fabrication, "
-        "or fake-leaning retrieval prior plus current rumor/sensational cues.\n"
-        "- Recommend changing fake->real when the only fake reason is weak visual non-proof, emotional wording, or uncertainty, "
-        "especially if retrieved examples favor real.\n"
-        "- If evidence is genuinely mixed, keep the initial label and lower confidence.\n\n"
+        "- Default suggested_label must be keep.\n"
+        "- Change only when the initial label strongly conflicts with retrieval_prior AND current visual/audio evidence does not support it.\n"
+        "- If initial=fake and retrieval_prior=fake, do NOT recommend fake->real unless the current video/audio directly verifies the claim as ordinary true news.\n"
+        "- If initial=real and retrieval_prior=real, do NOT recommend real->fake unless there is explicit contradiction, old/unrelated footage, fabrication, or hoax structure.\n"
+        "- Never change a label merely because proof is incomplete, wording is emotional, comments are skeptical, or audio repeats the title.\n"
+        "- If evidence is mixed or uncertain, keep the initial label and lower confidence.\n\n"
         f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
         f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
         f"current_auxiliary_prompt: {current_context}\n\n"
         f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+        f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
         f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
         "Return only valid JSON with this schema:\n"
         "{\n"
@@ -624,6 +798,7 @@ def _judge_review_prompt(
 def _judge_final_prompt(
     row: dict[str, Any],
     visual: dict[str, Any],
+    audio: dict[str, Any],
     examples: list[dict[str, Any]],
     initial_judge: dict[str, Any],
     review: dict[str, Any],
@@ -634,16 +809,18 @@ def _judge_final_prompt(
     if dataset.lower() == "fakesv":
         return (
             "你是中文短视频虚假新闻检测二阶段 loop 的最终裁决器。\n"
-            "请综合初判和复核意见，输出最终 real/fake。检索样本用于校准数据集边界，但不是当前事件的事实证明。\n\n"
+            "请以初判为默认最终结果；复核意见只用于发现高置信初判错误。检索样本用于校准数据集边界，但不是当前事件的事实证明。\n\n"
             "最终规则：\n"
-            "- 只有复核指出具体当前视频证据或明确检索边界问题时，才改变初判。\n"
-            "- 不要因为抽样视频缺少完整证明就判 fake。\n"
-            "- 不要因为字幕、评论或画面重复异常声称就判 real。\n"
-            "- 证据混合时使用中等置信度。\n\n"
+            "- 默认输出 initial_judge 的 LABEL。\n"
+            "- 只有 verifier_review 明确 suggested_label 不是 keep，且给出高置信当前视频/音频证据时，才允许改判。\n"
+            "- initial=fake 且 retrieval_prior=fake 时，极难改成 real；除非当前视频/音频直接证明标题声称是真实普通新闻。\n"
+            "- initial=real 且 retrieval_prior=real 时，极难改成 fake；除非存在明确矛盾、旧/无关画面、伪造或谣言结构。\n"
+            "- 不要因为缺少完整证明、情绪化语气、音频重复标题、或复核中的泛泛不确定性改判。\n\n"
             f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
             f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
             f"current_auxiliary_prompt: {current_context}\n\n"
             f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+            f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
             f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
             f"verifier_review_json: {json.dumps(review, ensure_ascii=False)}\n\n"
             "不要输出思考过程或 <think>。严格输出4行，key必须使用英文：\n"
@@ -654,17 +831,20 @@ def _judge_final_prompt(
         )
     return (
         "You are the final arbiter in a lightweight judge loop for short-video fake-news detection.\n"
-        "Use the initial decision and verifier review, but output your own final label. "
+        "Treat the initial decision as the default final label. The verifier review is only for catching high-confidence initial-judge errors. "
         "Respect dataset-calibrated retrieved examples without treating them as factual proof.\n\n"
         "Final arbitration rules:\n"
-        "- Change the initial label only when the verifier names a concrete current-video cue or a clear retrieval-boundary issue.\n"
-        "- Do not label fake merely because the sampled video lacks complete proof.\n"
-        "- Do not label real merely because captions or visuals repeat an extraordinary claim.\n"
-        "- Prefer moderate confidence when evidence is mixed.\n\n"
+        "- Default to the initial_judge LABEL.\n"
+        "- Change the label only when verifier_review suggests a non-keep label AND names high-confidence current visual/audio evidence.\n"
+        "- If initial=fake and retrieval_prior=fake, almost never change to real unless current video/audio directly verifies the claim as ordinary true news.\n"
+        "- If initial=real and retrieval_prior=real, almost never change to fake unless there is explicit contradiction, old/unrelated footage, fabrication, or hoax structure.\n"
+        "- Do not change because proof is incomplete, tone is emotional, audio repeats the title, or the review is merely uncertain.\n"
+        "- Prefer keeping initial with adjusted confidence when evidence is mixed.\n\n"
         f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
         f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
         f"current_auxiliary_prompt: {current_context}\n\n"
         f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+        f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
         f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
         f"verifier_review_json: {json.dumps(review, ensure_ascii=False)}\n\n"
         "Do not output hidden reasoning or <think> blocks. Return exactly 4 lines in this format:\n"
@@ -866,7 +1046,125 @@ def _calibrate_prediction(judge: dict[str, Any], retrieval_prior: dict[str, Any]
     return judge
 
 
-def _judge_prompt(row: dict[str, Any], visual: dict[str, Any], examples: list[dict[str, Any]], dataset: str) -> str:
+def _evidence_text(*items: Any) -> str:
+    return " ".join(json.dumps(item, ensure_ascii=False).lower() for item in items)
+
+
+def _apply_conservative_loop_gate(
+    *,
+    initial_judge: dict[str, Any],
+    review: dict[str, Any],
+    final_judge: dict[str, Any],
+    retrieval_prior: dict[str, Any],
+    visual: dict[str, Any],
+    audio: dict[str, Any],
+) -> dict[str, Any]:
+    initial_label = str(initial_judge.get("prediction", "")).lower()
+    final_label = str(final_judge.get("prediction", "")).lower()
+    if initial_label not in {"real", "fake"} or final_label not in {"real", "fake"}:
+        return initial_judge
+    if final_label == initial_label:
+        kept = dict(final_judge)
+        kept["loop_gate"] = "kept_final_same_as_initial"
+        return kept
+
+    suggested = str(review.get("suggested_label", "keep")).lower()
+    review_reason = str(review.get("review_reason", ""))
+    review_text = _evidence_text(review, review_reason)
+    evidence_text = _evidence_text(visual, audio, final_judge)
+    prior_label = str(retrieval_prior.get("prior", "neutral")).lower()
+    prior_strength = float(retrieval_prior.get("strength", 0.0) or 0.0)
+
+    strong_fake_cue = any(
+        phrase in evidence_text
+        for phrase in [
+            "contradiction",
+            "contradicts",
+            "mismatch",
+            "unrelated_or_mismatch",
+            "unrelated footage",
+            "old footage",
+            "fabricated",
+            "hoax",
+            "false context",
+            "rumor",
+            "谣言",
+            "伪造",
+            "矛盾",
+            "不匹配",
+            "无关",
+            "旧画面",
+        ]
+    )
+    strong_real_cue = any(
+        phrase in evidence_text
+        for phrase in [
+            "ordinary coherent news",
+            "directly verifies",
+            "directly supports",
+            "directly shows",
+            "credible source",
+            "普通新闻",
+            "直接证明",
+            "直接支持",
+            "可信来源",
+        ]
+    )
+    weak_change_reason = any(
+        phrase in review_text
+        for phrase in [
+            "lack of direct visual proof",
+            "lacks direct visual proof",
+            "insufficient evidence",
+            "not enough evidence",
+            "uncertain",
+            "weak_nonproof",
+            "缺少完整证明",
+            "证据不完整",
+            "不确定",
+        ]
+    )
+
+    allow = False
+    reason = "blocked_by_conservative_loop_gate"
+    if suggested == final_label and not weak_change_reason:
+        if final_label == "fake":
+            allow = strong_fake_cue or (prior_label == "fake" and prior_strength >= 0.65 and strong_fake_cue)
+            reason = "allowed_real_to_fake_strong_fake_cue" if allow else reason
+        elif final_label == "real":
+            allow = strong_real_cue or (prior_label == "real" and prior_strength >= 0.65 and strong_real_cue)
+            reason = "allowed_fake_to_real_strong_real_cue" if allow else reason
+
+    if initial_label == "fake" and final_label == "real" and prior_label == "fake" and prior_strength >= 0.5:
+        allow = bool(strong_real_cue and suggested == "real" and not weak_change_reason)
+        reason = "allowed_fake_to_real_against_fake_prior_with_direct_real_evidence" if allow else "blocked_fake_to_real_against_fake_prior"
+    if initial_label == "real" and final_label == "fake" and prior_label == "real" and prior_strength >= 0.5:
+        allow = bool(strong_fake_cue and suggested == "fake" and not weak_change_reason)
+        reason = "allowed_real_to_fake_against_real_prior_with_strong_fake_evidence" if allow else "blocked_real_to_fake_against_real_prior"
+
+    if allow:
+        accepted = dict(final_judge)
+        accepted["loop_gate"] = reason
+        return accepted
+
+    kept = dict(initial_judge)
+    kept["loop_gate"] = reason
+    kept["blocked_final_prediction"] = final_label
+    kept["blocked_final_rationale"] = final_judge.get("rationale", "")
+    kept["key_factors"] = [
+        *list(initial_judge.get("key_factors", [])),
+        reason,
+    ]
+    return kept
+
+
+def _judge_prompt(
+    row: dict[str, Any],
+    visual: dict[str, Any],
+    audio: dict[str, Any],
+    examples: list[dict[str, Any]],
+    dataset: str,
+) -> str:
     current_context = _current_context(row)
     retrieval_prior = _retrieval_prior(examples, _current_claim_text(row))
     if dataset.lower() == "fakesv":
@@ -881,6 +1179,11 @@ def _judge_prompt(row: dict[str, Any], visual: dict[str, Any], examples: list[di
             "6. 优先判 fake 的强证据包括：当前视频内部明确矛盾、画面与声称高置信不匹配、无关/旧画面冒充当前事件、伪造/谣言结构，"
             "或声称中的关键身份、地点、原因、数量、速度等细节明显超出画面支持范围。\n"
             "7. 营销语言、情绪化表达、争议性、评论区质疑或不完整演示本身不足以判 fake。\n\n"
+            "音频证据规则：\n"
+            "- audio_evidence_json 是旁白/语气/背景声辅助证据。\n"
+            "- 旁白重复 title 或字幕，不等于独立证明。\n"
+            "- 情绪化、急迫、夸张语气只能作为弱 fake cue，不能单独决定 fake。\n"
+            "- 如果音频中的关键声称与画面/title 明显矛盾，或只有音频在制造关键误导声称，这是强 fake cue。\n\n"
             "检索先验规则：\n"
             "- retrieval_prior 来自训练集相似样本，是数据集边界校准线索，不是当前事件的外部事实证明。\n"
             "- 如果检索和当前证据冲突且没有决定性观察，降低 CONFIDENCE，而不是编造证据。\n"
@@ -889,6 +1192,7 @@ def _judge_prompt(row: dict[str, Any], visual: dict[str, Any], examples: list[di
             f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
             f"current_auxiliary_prompt: {current_context}\n\n"
             f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+            f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
             "不要输出思考过程或 <think>。严格输出4行，key必须使用英文：\n"
             "LABEL: real or fake\n"
             "FAKE_SCORE: number_between_0_and_1\n"
@@ -908,6 +1212,11 @@ def _judge_prompt(row: dict[str, Any], visual: dict[str, Any], examples: list[di
         "5. Prefer fake only for strong misinformation patterns: explicit claim-video contradiction, unrelated/old-footage false context, "
         "fabricated/hoax evidence, or current-post rumor framing that is stronger than the retrieval prior.\n"
         "6. Marketing language, emotional wording, or incomplete visual demonstration alone is not enough for fake.\n\n"
+        "Audio evidence rules:\n"
+        "- audio_evidence_json contains speech, tone, and background sound cues.\n"
+        "- Narration repeating the title/caption is not independent proof.\n"
+        "- Emotional, urgent, or dramatic tone is only a weak fake cue and cannot decide fake by itself.\n"
+        "- If audio makes a key claim that contradicts the video/title or introduces the decisive misleading context, treat it as strong fake evidence.\n\n"
         "Retrieval prior rules:\n"
         "- retrieval_prior is computed from train-set examples and is a strong dataset-boundary cue.\n"
         "- If retrieval_prior is real, predict fake only for old/unrelated footage, explicit contradiction, fabricated/hoax evidence, or strong current-post rumor framing.\n"
@@ -921,6 +1230,7 @@ def _judge_prompt(row: dict[str, Any], visual: dict[str, Any], examples: list[di
         f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
         f"current_auxiliary_prompt: {current_context}\n\n"
         f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+        f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
         "Do not output hidden reasoning or <think> blocks. Return exactly 4 lines in this format:\n"
         "LABEL: real or fake\n"
         "FAKE_SCORE: number_between_0_and_1\n"
@@ -967,8 +1277,11 @@ def run_two_stage(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    vlm, processor = load_model(config)
     text_model, tokenizer = _load_text_model(config)
+    vlm = None
+    processor = None
+    audio_model = None
+    audio_processor = None
     completed = _completed_ids(prediction_path) if resume else set()
     prediction_path.parent.mkdir(parents=True, exist_ok=True)
     fps = float(config["video"]["fps"])
@@ -992,6 +1305,20 @@ def run_two_stage(
     final_tokens = int(loop_config.get("final_max_new_tokens", judge_tokens))
     visual_cache_hits = 0
     visual_cache_misses = 0
+    audio_config = two_stage.get("audio_cache", {})
+    audio_enabled = bool(audio_config.get("enabled", False))
+    audio_cache = (
+        AudioEvidenceCache(resolve_path(repo_root, audio_config.get("path", "outputs/cache/audio_evidence.sqlite3")))
+        if audio_enabled
+        else None
+    )
+    audio_schema_version = int(audio_config.get("schema_version", 1))
+    audio_tokens = int(audio_config.get("max_new_tokens", 512))
+    audio_sample_rate = int(audio_config.get("sample_rate", 16000))
+    refresh_audio_cache = bool(audio_config.get("refresh", False))
+    live_audio_on_miss = bool(audio_config.get("live_on_miss", False))
+    audio_cache_hits = 0
+    audio_cache_misses = 0
 
     with prediction_path.open("a", encoding="utf-8", newline="\n") as output:
         for index, row in enumerate(rows, 1):
@@ -1033,6 +1360,8 @@ def run_two_stage(
                     )
                 else:
                     visual_cache_misses += 1
+                    if vlm is None or processor is None:
+                        vlm, processor = load_model(config)
                     visual_started = time.perf_counter()
                     video_frames, video_metadata, backend, decoder_errors = _load_video_frames(
                         video_path,
@@ -1089,6 +1418,78 @@ def run_two_stage(
                             source_total_frames=_metadata_value(model_video_metadata, "source_total_num_frames"),
                             elapsed_seconds=round(time.perf_counter() - visual_started, 4),
                         )
+                audio_prompt = _audio_prompt(row, dataset_name)
+                audio_key, audio_identity = _audio_cache_key(
+                    dataset=dataset_name,
+                    sample_id=sample_id,
+                    video_path=video_path,
+                    model_path=str(config.get("audio_model", {}).get("path", "")),
+                    prompt=audio_prompt,
+                    audio_max_new_tokens=audio_tokens,
+                    schema_version=audio_schema_version,
+                    sample_rate=audio_sample_rate,
+                )
+                cached_audio = None if refresh_audio_cache or audio_cache is None else audio_cache.get(audio_key)
+                if cached_audio is not None:
+                    audio_cache_hits += 1
+                    audio = cached_audio["audio"]
+                    audio_raw = cached_audio["raw_text"]
+                    print(
+                        json.dumps(
+                            {
+                                "event": "audio_evidence_cache_hit",
+                                "id": sample_id,
+                                "video": row["video"],
+                                "cache_key": audio_key,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                elif audio_enabled and live_audio_on_miss:
+                    audio_cache_misses += 1
+                    if audio_model is None or audio_processor is None:
+                        audio_model, audio_processor = _load_audio_model(config)
+                    audio_started = time.perf_counter()
+                    try:
+                        with tempfile.TemporaryDirectory(prefix="agentvideommd_audio_") as tmpdir:
+                            wav_path = Path(tmpdir) / f"{sample_id}.wav"
+                            _extract_audio_wav(video_path, wav_path, audio_sample_rate)
+                            audio_raw = _generate_text_with_audio(
+                                audio_model,
+                                audio_processor,
+                                wav_path,
+                                audio_prompt,
+                                max_new_tokens=audio_tokens,
+                                do_sample=False,
+                            )
+                        audio = _json_or_raw(audio_raw, "audio_raw_summary")
+                    except Exception as audio_exc:
+                        audio_raw = ""
+                        audio = {
+                            "audio_available": False,
+                            "audio_error": f"{type(audio_exc).__name__}: {audio_exc}",
+                            "decision_relevance": "low",
+                            "summary": "Audio extraction or audio-model inference failed.",
+                        }
+                    if audio_cache is not None:
+                        audio_cache.put(
+                            cache_key=audio_key,
+                            identity=audio_identity,
+                            audio=audio,
+                            raw_text=audio_raw,
+                            backend="qwen2_audio_live",
+                            elapsed_seconds=round(time.perf_counter() - audio_started, 4),
+                        )
+                else:
+                    audio_cache_misses += 1 if audio_enabled else 0
+                    audio_raw = ""
+                    audio = {
+                        "audio_available": False,
+                        "audio_error": "audio cache miss; live extraction disabled",
+                        "decision_relevance": "low",
+                        "summary": "Audio evidence was not available for this judge run.",
+                    }
                 examples = _load_dynamic_examples(
                     repo_root,
                     dataset_name,
@@ -1100,7 +1501,7 @@ def run_two_stage(
                 judge_raw = _generate_text_only(
                     text_model,
                     tokenizer,
-                    _judge_prompt(row, visual, examples, dataset_name),
+                    _judge_prompt(row, visual, audio, examples, dataset_name),
                     max_new_tokens=judge_tokens,
                     do_sample=False,
                 )
@@ -1108,12 +1509,13 @@ def run_two_stage(
                 review_raw = ""
                 review = {}
                 final_raw = ""
+                final_judge = {}
                 judge = initial_judge
                 if loop_enabled:
                     review_raw = _generate_text_only(
                         text_model,
                         tokenizer,
-                        _judge_review_prompt(row, visual, examples, initial_judge, retrieval_prior, dataset_name),
+                        _judge_review_prompt(row, visual, audio, examples, initial_judge, retrieval_prior, dataset_name),
                         max_new_tokens=review_tokens,
                         do_sample=False,
                     )
@@ -1121,11 +1523,19 @@ def run_two_stage(
                     final_raw = _generate_text_only(
                         text_model,
                         tokenizer,
-                        _judge_final_prompt(row, visual, examples, initial_judge, review, retrieval_prior, dataset_name),
+                        _judge_final_prompt(row, visual, audio, examples, initial_judge, review, retrieval_prior, dataset_name),
                         max_new_tokens=final_tokens,
                         do_sample=False,
                     )
-                    judge = _calibrate_prediction(_judge_from_raw(final_raw), retrieval_prior)
+                    final_judge = _calibrate_prediction(_judge_from_raw(final_raw), retrieval_prior)
+                    judge = _apply_conservative_loop_gate(
+                        initial_judge=initial_judge,
+                        review=review,
+                        final_judge=final_judge,
+                        retrieval_prior=retrieval_prior,
+                        visual=visual,
+                        audio=audio,
+                    )
                 prediction, parse_ok = normalize_prediction(str(judge.get("prediction", "")))
                 result.update(
                     {
@@ -1136,6 +1546,7 @@ def run_two_stage(
                         "key_factors": judge.get("key_factors", []),
                         "rationale": judge.get("rationale", ""),
                         "visual_evidence": visual,
+                        "audio_evidence": audio,
                         "retrieved_examples": examples,
                         "retrieval_prior": retrieval_prior,
                         "visual_raw": visual_raw,
@@ -1144,9 +1555,14 @@ def run_two_stage(
                         "initial_judge": initial_judge,
                         "review": review,
                         "review_raw": review_raw,
+                        "final_judge": final_judge,
                         "final_judge_raw": final_raw,
+                        "loop_gate": judge.get("loop_gate"),
                         "visual_cache_hit": cached_visual is not None,
                         "visual_cache_key": cache_key,
+                        "audio_raw": audio_raw,
+                        "audio_cache_hit": cached_audio is not None,
+                        "audio_cache_key": audio_key,
                         "error": None,
                     }
                 )
@@ -1164,7 +1580,7 @@ def run_two_stage(
             result["elapsed_seconds"] = round(time.perf_counter() - started, 4)
             output.write(json.dumps(result, ensure_ascii=False) + "\n")
             output.flush()
-            print(json.dumps({"index": index, **{k: v for k, v in result.items() if k not in {"visual_evidence", "visual_raw", "judge_raw", "retrieved_examples"}}}, ensure_ascii=False), flush=True)
+            print(json.dumps({"index": index, **{k: v for k, v in result.items() if k not in {"visual_evidence", "visual_raw", "audio_evidence", "audio_raw", "judge_raw", "retrieved_examples"}}}, ensure_ascii=False), flush=True)
 
     if limit is not None:
         return {
@@ -1174,11 +1590,225 @@ def run_two_stage(
             "metrics_written": False,
             "visual_cache_hits": visual_cache_hits,
             "visual_cache_misses": visual_cache_misses,
+            "audio_cache_hits": audio_cache_hits,
+            "audio_cache_misses": audio_cache_misses,
             "judge_loop_enabled": loop_enabled,
         }
     metrics = evaluate_prediction_file(prediction_path)
     metrics["visual_cache_hits"] = visual_cache_hits
     metrics["visual_cache_misses"] = visual_cache_misses
+    metrics["audio_cache_hits"] = audio_cache_hits
+    metrics["audio_cache_misses"] = audio_cache_misses
     metrics["judge_loop_enabled"] = loop_enabled
     write_json_atomic(metrics_path, metrics)
     return metrics
+
+
+def build_evidence_cache(
+    config_path: Path,
+    repo_root: Path,
+    video_root_override: Path | None = None,
+    audio_model_path_override: str | None = None,
+    limit: int | None = None,
+    include_visual: bool = True,
+    include_audio: bool = True,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    config = load_config(config_path)
+    if audio_model_path_override:
+        config.setdefault("audio_model", {})["path"] = audio_model_path_override
+    two_stage = config.get("two_stage", {})
+    dataset_name = str(config["dataset"]["name"]).lower()
+    manifest_path = resolve_path(repo_root, config["dataset"]["manifest"])
+    video_root = video_root_override or Path(config["dataset"]["video_root"])
+    rows = list(read_jsonl(manifest_path))
+    if limit is not None:
+        rows = rows[:limit]
+
+    fps = float(config["video"]["fps"])
+    decoder_backend = str(config["video"].get("decoder_backend", "decord"))
+    fallback_num_frames = int(config["video"].get("fallback_num_frames", 16))
+    visual_tokens = int(two_stage.get("visual_max_new_tokens", 512))
+    max_video_frames = int(two_stage.get("max_video_frames", 64))
+    visual_cache_config = two_stage.get("visual_cache", {})
+    visual_cache = StageOneVisualCache(
+        resolve_path(repo_root, visual_cache_config.get("path", "outputs/cache/stage1_visual.sqlite3"))
+    )
+    visual_schema_version = int(visual_cache_config.get("schema_version", 1))
+
+    audio_config = two_stage.get("audio_cache", {})
+    audio_cache = AudioEvidenceCache(resolve_path(repo_root, audio_config.get("path", "outputs/cache/audio_evidence.sqlite3")))
+    audio_schema_version = int(audio_config.get("schema_version", 1))
+    audio_tokens = int(audio_config.get("max_new_tokens", 512))
+    audio_sample_rate = int(audio_config.get("sample_rate", 16000))
+
+    stats: dict[str, Any] = {
+        "dataset": dataset_name,
+        "requested": len(rows),
+        "visual": {"enabled": include_visual, "hits": 0, "misses": 0, "written": 0, "failed": 0},
+        "audio": {"enabled": include_audio, "hits": 0, "misses": 0, "written": 0, "failed": 0},
+        "visual_cache": str(visual_cache.path),
+        "audio_cache": str(audio_cache.path),
+    }
+
+    if include_visual:
+        vlm, processor = load_model(config)
+        for index, row in enumerate(rows, 1):
+            sample_id = str(row["id"])
+            video_path = video_root / row["video"]
+            prompt = _visual_prompt(row, dataset_name)
+            cache_key, identity = _visual_cache_key(
+                dataset=dataset_name,
+                sample_id=sample_id,
+                video_path=video_path,
+                model_path=str(config.get("model", {}).get("path", "")),
+                prompt=prompt,
+                max_video_frames=max_video_frames,
+                visual_max_new_tokens=visual_tokens,
+                schema_version=visual_schema_version,
+            )
+            if not refresh and visual_cache.get(cache_key) is not None:
+                stats["visual"]["hits"] += 1
+                print(json.dumps({"event": "visual_cache_hit", "index": index, "id": sample_id}, ensure_ascii=False), flush=True)
+                continue
+            stats["visual"]["misses"] += 1
+            started = time.perf_counter()
+            try:
+                video_frames, video_metadata, backend, decoder_errors = _load_video_frames(
+                    video_path,
+                    fps,
+                    decoder_backend,
+                    fallback_num_frames,
+                )
+                video_frames, model_video_metadata = _uniform_sample_video(video_frames, video_metadata, max_video_frames, fps)
+                raw = _generate_text_with_video(
+                    vlm,
+                    processor,
+                    video_frames,
+                    model_video_metadata,
+                    prompt,
+                    fps,
+                    max_new_tokens=visual_tokens,
+                    do_sample=False,
+                )
+                visual = _json_or_raw(raw, "visual_raw_summary")
+                visual_cache.put(
+                    cache_key=cache_key,
+                    identity=identity,
+                    visual=visual,
+                    raw_text=raw,
+                    backend=str(backend),
+                    sampled_frames=len(video_frames),
+                    source_total_frames=_metadata_value(model_video_metadata, "source_total_num_frames"),
+                    elapsed_seconds=round(time.perf_counter() - started, 4),
+                )
+                stats["visual"]["written"] += 1
+                print(
+                    json.dumps(
+                        {
+                            "event": "visual_cache_write",
+                            "index": index,
+                            "id": sample_id,
+                            "video": row["video"],
+                            "backend": backend,
+                            "frames": len(video_frames),
+                            "decoder_errors": decoder_errors,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:
+                stats["visual"]["failed"] += 1
+                print(
+                    json.dumps(
+                        {
+                            "event": "visual_cache_error",
+                            "index": index,
+                            "id": sample_id,
+                            "video": row["video"],
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+        try:
+            import torch
+
+            del vlm, processor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    if include_audio:
+        audio_model, audio_processor = _load_audio_model(config)
+        for index, row in enumerate(rows, 1):
+            sample_id = str(row["id"])
+            video_path = video_root / row["video"]
+            prompt = _audio_prompt(row, dataset_name)
+            cache_key, identity = _audio_cache_key(
+                dataset=dataset_name,
+                sample_id=sample_id,
+                video_path=video_path,
+                model_path=str(config.get("audio_model", {}).get("path", "")),
+                prompt=prompt,
+                audio_max_new_tokens=audio_tokens,
+                schema_version=audio_schema_version,
+                sample_rate=audio_sample_rate,
+            )
+            if not refresh and audio_cache.get(cache_key) is not None:
+                stats["audio"]["hits"] += 1
+                print(json.dumps({"event": "audio_cache_hit", "index": index, "id": sample_id}, ensure_ascii=False), flush=True)
+                continue
+            stats["audio"]["misses"] += 1
+            started = time.perf_counter()
+            try:
+                with tempfile.TemporaryDirectory(prefix="agentvideommd_audio_") as tmpdir:
+                    wav_path = Path(tmpdir) / f"{sample_id}.wav"
+                    _extract_audio_wav(video_path, wav_path, audio_sample_rate)
+                    raw = _generate_text_with_audio(
+                        audio_model,
+                        audio_processor,
+                        wav_path,
+                        prompt,
+                        max_new_tokens=audio_tokens,
+                        do_sample=False,
+                    )
+                audio = _json_or_raw(raw, "audio_raw_summary")
+                backend = "qwen2_audio"
+            except Exception as exc:
+                raw = ""
+                audio = {
+                    "audio_available": False,
+                    "audio_error": f"{type(exc).__name__}: {exc}",
+                    "decision_relevance": "low",
+                    "summary": "Audio extraction or audio-model inference failed.",
+                }
+                backend = "audio_error"
+                stats["audio"]["failed"] += 1
+            audio_cache.put(
+                cache_key=cache_key,
+                identity=identity,
+                audio=audio,
+                raw_text=raw,
+                backend=backend,
+                elapsed_seconds=round(time.perf_counter() - started, 4),
+            )
+            stats["audio"]["written"] += 1
+            print(
+                json.dumps(
+                    {
+                        "event": "audio_cache_write",
+                        "index": index,
+                        "id": sample_id,
+                        "video": row["video"],
+                        "backend": backend,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+    return stats

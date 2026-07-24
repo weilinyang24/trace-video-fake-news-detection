@@ -12,6 +12,13 @@ text_model:
   attn_implementation: flash_attention_2
   device_map: auto
   trust_remote_code: true
+audio_model:
+  path: /data2/573ops_ser/models/Qwen2-Audio-7B-Instruct
+  backend: qwen2_audio
+  dtype: bfloat16
+  attn_implementation: flash_attention_2
+  device_map: auto
+  trust_remote_code: true
 dataset:
   name: fakesv
   manifest: data/manifests/fakesv_test.jsonl
@@ -44,6 +51,14 @@ two_stage:
     path: outputs/cache/stage1_visual.sqlite3
     schema_version: 1
     refresh: false
+  audio_cache:
+    enabled: true
+    path: outputs/cache/audio_evidence.sqlite3
+    schema_version: 1
+    refresh: false
+    live_on_miss: false
+    sample_rate: 16000
+    max_new_tokens: 512
   judge_loop:
     enabled: true
     review_max_new_tokens: 256
