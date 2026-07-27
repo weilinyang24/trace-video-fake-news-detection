@@ -747,7 +747,9 @@ def _judge_review_prompt(
             "你的默认任务是验证初判，而不是重新自由裁决。除非发现高置信错误，否则必须保持初判。\n\n"
             "修正规则：\n"
             "- 默认 suggested_label 必须是 keep。\n"
-            "- 只有当初判与 retrieval_prior 强冲突，且当前视觉/音频没有支持初判的强证据时，才建议改判。\n"
+            "- 当初判与 retrieval_prior 强冲突，且当前视觉/音频没有支持初判的强证据时，可以建议改判。\n"
+            "- 如果 initial=real 但 retrieval_prior=fake 且 strength>=0.75，并且当前视频主要只是字幕/旁白重复声称、标题党/谣言化表达、无直接真实新闻证据，可以建议 real->fake。\n"
+            "- 如果 initial=fake 但 retrieval_prior=real 且 strength>=0.75，并且当前视频/音频直接呈现普通新闻、可信来源或完整事件链，可以建议 fake->real。\n"
             "- initial=fake 且 retrieval_prior=fake 时，禁止建议 fake->real，除非视频/音频明确直接证明新闻声称为真。\n"
             "- initial=real 且 retrieval_prior=real 时，禁止建议 real->fake，除非存在明确当前视频内部矛盾、无关/旧画面、伪造/谣言结构。\n"
             "- 不要因为“缺少完整证明”“情绪化表达”“评论质疑”“音频重复标题”建议改判。\n"
@@ -773,7 +775,9 @@ def _judge_review_prompt(
         "Recommend a label change only for high-confidence initial-judge errors.\n\n"
         "Correction policy:\n"
         "- Default suggested_label must be keep.\n"
-        "- Change only when the initial label strongly conflicts with retrieval_prior AND current visual/audio evidence does not support it.\n"
+        "- You may suggest a change when the initial label strongly conflicts with retrieval_prior AND current visual/audio evidence does not support it.\n"
+        "- If initial=real but retrieval_prior=fake with strength>=0.75, and the current video mainly repeats the claim through text/audio, uses sensational/rumor framing, or lacks direct ordinary-news verification, you may suggest real->fake.\n"
+        "- If initial=fake but retrieval_prior=real with strength>=0.75, and the current video/audio directly presents ordinary news, credible source material, or a coherent event chain, you may suggest fake->real.\n"
         "- If initial=fake and retrieval_prior=fake, do NOT recommend fake->real unless the current video/audio directly verifies the claim as ordinary true news.\n"
         "- If initial=real and retrieval_prior=real, do NOT recommend real->fake unless there is explicit contradiction, old/unrelated footage, fabrication, or hoax structure.\n"
         "- Never change a label merely because proof is incomplete, wording is emotional, comments are skeptical, or audio repeats the title.\n"
@@ -1087,6 +1091,13 @@ def _apply_conservative_loop_gate(
             "fabricated",
             "hoax",
             "false context",
+            "misleading",
+            "sensational",
+            "sensationalized",
+            "clickbait",
+            "text overlay",
+            "text overlays",
+            "narrates_or_repeats_claim",
             "rumor",
             "谣言",
             "伪造",
@@ -1094,6 +1105,9 @@ def _apply_conservative_loop_gate(
             "不匹配",
             "无关",
             "旧画面",
+            "误导",
+            "标题党",
+            "夸张",
         ]
     )
     strong_real_cue = any(
@@ -1134,6 +1148,42 @@ def _apply_conservative_loop_gate(
         elif final_label == "real":
             allow = strong_real_cue or (prior_label == "real" and prior_strength >= 0.65 and strong_real_cue)
             reason = "allowed_fake_to_real_strong_real_cue" if allow else reason
+
+    if initial_label == "real" and final_label == "fake" and prior_label == "fake" and prior_strength >= 0.75:
+        prior_aligned_fake_cue = any(
+            phrase in evidence_text
+            for phrase in [
+                "narrates_or_repeats_claim",
+                "misleading",
+                "sensational",
+                "sensationalized",
+                "text overlay",
+                "text overlays",
+                "rumor",
+                "hoax",
+                "fabricated",
+                "false context",
+                "repeats_title_only",
+                "audio_only_claim",
+            ]
+        )
+        allow = bool(suggested == "fake" and prior_aligned_fake_cue)
+        reason = "allowed_real_to_fake_strong_fake_prior_with_repetition_or_misleading_cue" if allow else reason
+
+    if initial_label == "fake" and final_label == "real" and prior_label == "real" and prior_strength >= 0.75:
+        prior_aligned_real_cue = any(
+            phrase in evidence_text
+            for phrase in [
+                "directly_shows_claim",
+                "directly supports",
+                "directly verifies",
+                "ordinary coherent news",
+                "credible source",
+                "news_report",
+            ]
+        )
+        allow = bool(suggested == "real" and prior_aligned_real_cue and not strong_fake_cue)
+        reason = "allowed_fake_to_real_strong_real_prior_with_direct_support" if allow else reason
 
     if initial_label == "fake" and final_label == "real" and prior_label == "fake" and prior_strength >= 0.5:
         allow = bool(strong_real_cue and suggested == "real" and not weak_change_reason)
