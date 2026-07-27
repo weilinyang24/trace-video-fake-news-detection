@@ -1076,8 +1076,10 @@ def _apply_conservative_loop_gate(
     review_reason = str(review.get("review_reason", ""))
     review_text = _evidence_text(review, review_reason)
     evidence_text = _evidence_text(visual, audio, final_judge)
+    support_text = f"{review_text} {evidence_text}"
     prior_label = str(retrieval_prior.get("prior", "neutral")).lower()
     prior_strength = float(retrieval_prior.get("strength", 0.0) or 0.0)
+    final_confidence = float(final_judge.get("confidence", 0.0) or 0.0)
 
     strong_fake_cue = any(
         phrase in evidence_text
@@ -1114,13 +1116,106 @@ def _apply_conservative_loop_gate(
         phrase in evidence_text
         for phrase in [
             "ordinary coherent news",
+            "ordinary news",
+            "ordinary news elements",
             "directly verifies",
             "directly supports",
             "directly shows",
             "credible source",
+            "credible context",
+            "support real news",
+            "supports real news",
+            "similar claims support real",
+            "does not clearly contradict",
+            "not clearly contradict",
             "普通新闻",
+            "普通新闻元素",
+            "频道报道",
+            "客服介入",
+            "正在介入",
+            "乡村频道",
+            "未发现明确伪造",
+            "未发现明确伪造或矛盾",
             "直接证明",
             "直接支持",
+            "可信来源",
+        ]
+    )
+    hard_fake_cue = any(
+        phrase in evidence_text
+        for phrase in [
+            "explicit contradiction",
+            "direct contradiction",
+            "contradicts the claim",
+            "old footage",
+            "unrelated footage",
+            "fabricated",
+            "hoax",
+            "false context",
+            "明确矛盾",
+            "直接矛盾",
+            "旧画面",
+            "无关画面",
+            "伪造",
+            "谣言结构",
+        ]
+    )
+    negated_hard_fake_cue = any(
+        phrase in evidence_text
+        for phrase in [
+            "no clear evidence of fabrication",
+            "no clear evidence of contradiction",
+            "does not clearly contradict",
+            "not clearly contradict",
+            "未发现明确伪造",
+            "未发现明确伪造或矛盾",
+            "没有明确伪造",
+            "没有明确矛盾",
+            "无明确伪造",
+            "无明确矛盾",
+        ]
+    )
+    if negated_hard_fake_cue:
+        hard_fake_cue = False
+    review_or_final_supports_fake = suggested == "fake" or any(
+        phrase in support_text
+        for phrase in [
+            "strongly favors fake",
+            "favors fake",
+            "supports fake",
+            "supporting the fake",
+            "fake label",
+            "fake examples",
+            "fake prior",
+            "aligning with the retrieval prior",
+            "aligns with the retrieval prior",
+            "supporting a fake label",
+            "支持 fake",
+            "支持虚假",
+            "偏向 fake",
+            "强烈偏向 fake",
+        ]
+    )
+    review_or_final_supports_real = suggested == "real" or any(
+        phrase in support_text
+        for phrase in [
+            "strongly favors real",
+            "favors real",
+            "supports real",
+            "support real news",
+            "supports real news",
+            "real label",
+            "real examples",
+            "real prior",
+            "ordinary news",
+            "ordinary news elements",
+            "credible source",
+            "credible context",
+            "符合 real",
+            "支持 real",
+            "支持真实",
+            "普通新闻",
+            "普通新闻元素",
             "可信来源",
         ]
     )
@@ -1143,7 +1238,10 @@ def _apply_conservative_loop_gate(
     reason = "blocked_by_conservative_loop_gate"
     if suggested == final_label and not weak_change_reason:
         if final_label == "fake":
-            allow = strong_fake_cue or (prior_label == "fake" and prior_strength >= 0.65 and strong_fake_cue)
+            allow = (
+                (prior_label == "fake" and prior_strength >= 0.75 and strong_fake_cue)
+                or (hard_fake_cue and final_confidence >= 0.8 and not strong_real_cue)
+            )
             reason = "allowed_real_to_fake_strong_fake_cue" if allow else reason
         elif final_label == "real":
             allow = strong_real_cue or (prior_label == "real" and prior_strength >= 0.65 and strong_real_cue)
@@ -1153,21 +1251,20 @@ def _apply_conservative_loop_gate(
         prior_aligned_fake_cue = any(
             phrase in evidence_text
             for phrase in [
-                "narrates_or_repeats_claim",
-                "misleading",
-                "sensational",
-                "sensationalized",
                 "text overlay",
                 "text overlays",
-                "rumor",
+                "misleading caption",
+                "meme",
+                "no credible news cue",
+                "no credible news cues",
+                "does not support the claim",
+                "explicitly states the claim is false",
                 "hoax",
                 "fabricated",
                 "false context",
-                "repeats_title_only",
-                "audio_only_claim",
             ]
         )
-        allow = bool(suggested == "fake" and prior_aligned_fake_cue)
+        allow = bool(review_or_final_supports_fake and prior_aligned_fake_cue)
         reason = "allowed_real_to_fake_strong_fake_prior_with_repetition_or_misleading_cue" if allow else reason
 
     if initial_label == "fake" and final_label == "real" and prior_label == "real" and prior_strength >= 0.75:
@@ -1178,12 +1275,33 @@ def _apply_conservative_loop_gate(
                 "directly supports",
                 "directly verifies",
                 "ordinary coherent news",
+                "ordinary news",
+                "ordinary news elements",
                 "credible source",
+                "credible context",
+                "support real news",
+                "supports real news",
+                "similar claims support real",
+                "not clearly contradict",
+                "does not clearly contradict",
                 "news_report",
+                "普通新闻",
+                "普通新闻元素",
+                "频道报道",
+                "客服介入",
+                "正在介入",
+                "乡村频道",
+                "未发现明确伪造",
+                "未发现明确伪造或矛盾",
+                "可信来源",
             ]
         )
-        allow = bool(suggested == "real" and prior_aligned_real_cue and not strong_fake_cue)
+        allow = bool(review_or_final_supports_real and prior_aligned_real_cue and not hard_fake_cue)
         reason = "allowed_fake_to_real_strong_real_prior_with_direct_support" if allow else reason
+
+    if initial_label == "fake" and final_label == "real" and prior_label == "neutral":
+        allow = bool(review_or_final_supports_real and strong_real_cue and not hard_fake_cue)
+        reason = "allowed_fake_to_real_neutral_prior_with_ordinary_news_evidence" if allow else reason
 
     if initial_label == "fake" and final_label == "real" and prior_label == "fake" and prior_strength >= 0.5:
         allow = bool(strong_real_cue and suggested == "real" and not weak_change_reason)
