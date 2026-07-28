@@ -44,7 +44,7 @@ runtime:
 two_stage:
   ablation:
     use_audio: true
-    use_rag: true
+    use_rag: false
     use_loop: true
   retrieval_per_label: 2
   max_video_frames: 64
@@ -67,5 +67,5 @@ two_stage:
     enabled: true
     review_max_new_tokens: 256
     final_max_new_tokens: 384
-  predictions: outputs/qwen3_vl_30b_twostage/fakett_test_predictions.jsonl
-  metrics: outputs/qwen3_vl_30b_twostage/fakett_test_metrics.json
+  predictions: outputs/ablations/fakett_e2_wo_rag_predictions.jsonl
+  metrics: outputs/ablations/fakett_e2_wo_rag_metrics.json

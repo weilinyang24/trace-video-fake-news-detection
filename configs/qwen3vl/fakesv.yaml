@@ -42,6 +42,10 @@ output:
 runtime:
   max_consecutive_errors: 3
 two_stage:
+  ablation:
+    use_audio: true
+    use_rag: true
+    use_loop: true
   retrieval_per_label: 2
   max_video_frames: 64
   visual_max_new_tokens: 768

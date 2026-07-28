@@ -77,6 +77,7 @@ def _normalize_attn_implementation(value: str) -> str:
 
 
 def load_model(config: dict[str, Any]):
+    import gc
     import torch
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -97,13 +98,58 @@ def load_model(config: dict[str, Any]):
         ),
         flush=True,
     )
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_path,
-        dtype=_torch_dtype(torch, model_config.get("dtype", "bfloat16")),
-        attn_implementation=attn_implementation,
-        device_map=model_config.get("device_map", "auto"),
-        trust_remote_code=bool(model_config.get("trust_remote_code", True)),
-    ).eval()
+    load_kwargs = {
+        "dtype": _torch_dtype(torch, model_config.get("dtype", "bfloat16")),
+        "attn_implementation": attn_implementation,
+        "device_map": model_config.get("device_map", "auto"),
+        "trust_remote_code": bool(model_config.get("trust_remote_code", True)),
+    }
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(model_path, **load_kwargs).eval()
+    except RuntimeError as exc:
+        message = str(exc)
+        if "automatic conversion of the weights" not in message and "`CONVERSION` entries" not in message:
+            raise
+        print(
+            json.dumps(
+                {
+                    "event": "load_model_retry_ignore_conversion_report",
+                    "model_path": model_path,
+                    "reason": message.splitlines()[0],
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        import transformers.modeling_utils as modeling_utils
+        import transformers.utils.loading_report as loading_report
+
+        original_modeling_report = modeling_utils.log_state_dict_report
+        original_loading_report = loading_report.log_state_dict_report
+
+        def _warn_only_loading_report(*args, **kwargs):
+            print(
+                json.dumps(
+                    {
+                        "event": "ignored_transformers_weight_conversion_report",
+                        "model_path": model_path,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return None
+
+        try:
+            modeling_utils.log_state_dict_report = _warn_only_loading_report
+            loading_report.log_state_dict_report = _warn_only_loading_report
+            model = AutoModelForImageTextToText.from_pretrained(model_path, **load_kwargs).eval()
+        finally:
+            modeling_utils.log_state_dict_report = original_modeling_report
+            loading_report.log_state_dict_report = original_loading_report
     processor = AutoProcessor.from_pretrained(
         model_path,
         trust_remote_code=bool(model_config.get("trust_remote_code", True)),

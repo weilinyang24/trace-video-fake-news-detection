@@ -43,11 +43,14 @@ runtime:
   max_consecutive_errors: 3
 two_stage:
   ablation:
-    use_audio: true
+    direct_vlm_rag: true
+    use_audio: false
     use_rag: true
-    use_loop: true
+    use_retrieval_prior: false
+    use_loop: false
   retrieval_per_label: 2
   max_video_frames: 64
+  direct_vlm_max_new_tokens: 384
   visual_max_new_tokens: 768
   judge_max_new_tokens: 384
   visual_cache:
@@ -64,8 +67,8 @@ two_stage:
     sample_rate: 16000
     max_new_tokens: 512
   judge_loop:
-    enabled: true
+    enabled: false
     review_max_new_tokens: 256
     final_max_new_tokens: 384
-  predictions: outputs/qwen3_vl_30b_twostage/fakett_test_predictions.jsonl
-  metrics: outputs/qwen3_vl_30b_twostage/fakett_test_metrics.json
+  predictions: outputs/ablations/fakett_e5_qwen3vl_rag_noprior_predictions.jsonl
+  metrics: outputs/ablations/fakett_e5_qwen3vl_rag_noprior_metrics.json
