@@ -808,8 +808,39 @@ def _judge_final_prompt(
     review: dict[str, Any],
     retrieval_prior: dict[str, Any],
     dataset: str,
+    freeform_label_space: bool = False,
 ) -> str:
     current_context = _current_context(row)
+    if freeform_label_space:
+        if dataset.lower() == "fakesv":
+            return (
+                "你是中文短视频虚假新闻检测二阶段 loop 的最终裁决器。\n"
+                "这是标签空间控制消融：所有证据组件都可用，但不要按固定 `LABEL: real/fake` 格式输出，也不要为了标签平衡人为偏向任一类别。\n"
+                "请自然语言判断当前短视频新闻整体更可信/真实，还是更不可信/虚假/误导；即使证据不完全，也必须给出一个倾向，方便后续评估解析。\n\n"
+                f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
+                f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
+                f"current_auxiliary_prompt: {current_context}\n\n"
+                f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+                f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
+                f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
+                f"verifier_review_json: {json.dumps(review, ensure_ascii=False)}\n\n"
+                "请用一小段中文回答，不要输出 JSON、Markdown、LABEL 字段或 <think>。"
+            )
+        return (
+            "You are the final arbiter in a lightweight judge loop for short-video fake-news detection.\n"
+            "This is a label-space-control ablation: all evidence components are available, but do not use the fixed `LABEL: real/fake` output format "
+            "and do not artificially bias toward either class for label balancing.\n"
+            "Answer freely in natural language whether the current video news is more credible/true or more false/misleading. "
+            "Even if evidence is incomplete, state a clear leaning so the evaluator can parse it.\n\n"
+            f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
+            f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
+            f"current_auxiliary_prompt: {current_context}\n\n"
+            f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+            f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
+            f"initial_judge_json: {json.dumps(initial_judge, ensure_ascii=False)}\n\n"
+            f"verifier_review_json: {json.dumps(review, ensure_ascii=False)}\n\n"
+            "Answer in one concise paragraph. Do not output JSON, markdown, LABEL fields, or <think>."
+        )
     if dataset.lower() == "fakesv":
         return (
             "你是中文短视频虚假新闻检测二阶段 loop 的最终裁决器。\n"
@@ -1332,9 +1363,37 @@ def _judge_prompt(
     audio: dict[str, Any],
     examples: list[dict[str, Any]],
     dataset: str,
+    freeform_label_space: bool = False,
 ) -> str:
     current_context = _current_context(row)
     retrieval_prior = _retrieval_prior(examples, _current_claim_text(row))
+    if freeform_label_space:
+        if dataset.lower() == "fakesv":
+            return (
+                "你是中文短视频虚假新闻检测的校准裁决器。\n"
+                "这是标签空间控制消融：视觉、音频、RAG 与检索先验都可使用，但不要按固定 `LABEL: real/fake` 格式输出，"
+                "也不要为了标签平衡人为偏向任一类别。\n"
+                "请自然语言判断当前短视频新闻整体更可信/真实，还是更不可信/虚假/误导；即使证据不完全，也必须给出一个倾向，方便后续评估解析。\n\n"
+                f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
+                f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
+                f"current_auxiliary_prompt: {current_context}\n\n"
+                f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+                f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
+                "请用一小段中文回答，不要输出 JSON、Markdown、LABEL 字段或 <think>。"
+            )
+        return (
+            "You are a calibrated judge for short-video fake-news detection.\n"
+            "This is a label-space-control ablation: visual evidence, audio evidence, RAG examples, and retrieval prior are available, "
+            "but do not use the fixed `LABEL: real/fake` output format and do not artificially bias toward either class for label balancing.\n"
+            "Answer freely in natural language whether the current video news is more credible/true or more false/misleading. "
+            "Even if evidence is incomplete, state a clear leaning so the evaluator can parse it.\n\n"
+            f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
+            f"retrieved_training_examples: {json.dumps(examples, ensure_ascii=False)}\n\n"
+            f"current_auxiliary_prompt: {current_context}\n\n"
+            f"visual_evidence_json: {json.dumps(visual, ensure_ascii=False)}\n\n"
+            f"audio_evidence_json: {json.dumps(audio, ensure_ascii=False)}\n\n"
+            "Answer in one concise paragraph. Do not output JSON, markdown, LABEL fields, or <think>."
+        )
     if dataset.lower() == "fakesv":
         return (
             "你是中文短视频虚假新闻检测的校准裁决器。请判断当前样本在数据集中的标签：real 或 fake。\n\n"
@@ -1411,38 +1470,86 @@ def _direct_vlm_rag_prompt(
     row: dict[str, Any],
     examples: list[dict[str, Any]],
     dataset: str,
+    use_rag: bool = True,
+    freeform_label_space: bool = False,
 ) -> str:
     current_context = _current_context(row)
+    if freeform_label_space:
+        if dataset.lower() == "fakesv":
+            return (
+                "你是中文短视频新闻真实性分析助手。请直接观看当前视频，并阅读当前样本文本。\n"
+                "不要使用检索样例、先验、文本 Judge、review loop 或音频证据。\n"
+                "请用自然语言回答：这个短视频新闻整体是否可信、是否存在虚假或误导风险，并说明主要依据。\n"
+                "不要被要求在固定标签集合中选择，也不要输出固定格式。\n\n"
+                f"当前样本文本：\n{current_context}"
+            )
+        return (
+            "You are a short-video news credibility analyst. Watch the current video and read the current sample text.\n"
+            "Do not use retrieved examples, priors, a separate text Judge, a review loop, or audio evidence.\n"
+            "Answer freely in natural language: is this short-video news credible, or does it appear false/misleading? "
+            "Explain the main basis for your assessment.\n"
+            "Do not choose from a predefined label set and do not use a fixed output format.\n\n"
+            f"Current sample text:\n{current_context}"
+        )
+    rag_block_zh = (
+        f"retrieved_train_examples_json: {json.dumps(examples, ensure_ascii=False)}\n\n"
+        if use_rag
+        else ""
+    )
+    rag_block_en = (
+        f"retrieved_train_examples_json: {json.dumps(examples, ensure_ascii=False)}\n\n"
+        if use_rag
+        else ""
+    )
     if dataset.lower() == "fakesv":
+        mode_line = (
+            "这是 E5 消融实验：只允许使用 Qwen3-VL + RAG examples。不要调用文本 Judge、不要做多轮 review、不要使用音频证据。\n\n"
+            if use_rag
+            else "这是 E6 消融实验：只允许使用 Qwen3-VL 直接观看视频和当前样本文本。不要使用 RAG、retrieval prior、文本 Judge、review loop 或音频证据。\n\n"
+        )
+        rag_rule = (
+            "2. RAG 样例来自训练集相似样本，用于理解数据集标签边界；它不是外部事实证明，也不要把样例标签简单投票当成最终答案。\n"
+            if use_rag
+            else "2. 当前实验不提供任何检索样例或先验；只能依据当前视频与当前样本文本判断。\n"
+        )
         return (
             "你是中文短视频虚假新闻检测模型。请直接观看当前视频，并结合检索到的训练集相似样本，判断当前样本标签：real 或 fake。\n\n"
-            "这是 E5 消融实验：只允许使用 Qwen3-VL + RAG。不要调用文本 Judge、不要做多轮 review、不要使用音频证据。\n\n"
+            f"{mode_line}"
             "判断原则：\n"
             "1. title 是主要待核查新闻声称；keywords、发布者信息、地点和评论只是辅助上下文。\n"
-            "2. RAG 样例来自训练集相似样本，用于理解数据集标签边界；它不是外部事实证明，也不要把样例标签简单投票当成最终答案。\n"
+            f"{rag_rule}"
             "3. 不要因为画面缺少完整证明就直接判 fake；短视频常常只呈现事件片段。\n"
             "4. 优先判 fake 的强线索包括：画面与标题关键事实明显不匹配、旧/无关画面冒充当前事件、字幕/旁白只是重复谣言、标题党/夸张营销、伪造或谣言结构。\n"
             "5. 如果视频呈现普通新闻、现场记录、科普实验或完整事件链，且没有明确矛盾，倾向 real。\n\n"
             f"当前样本辅助文本：\n{current_context}\n\n"
-            f"retrieved_train_examples_json: {json.dumps(examples, ensure_ascii=False)}\n\n"
+            f"{rag_block_zh}"
             "不要输出 JSON、Markdown 或思维过程。严格输出 4 行：\n"
             "LABEL: real or fake\n"
             "FAKE_SCORE: number_between_0_and_1\n"
             "CONFIDENCE: number_between_0_and_1\n"
             "REASON: 一句中文理由"
         )
+    mode_line = (
+        "This is the E5 ablation: Qwen3-VL + RAG examples only. Do not use a separate text Judge, review loop, or audio evidence.\n\n"
+        if use_rag
+        else "This is the E6 ablation: Qwen3-VL direct inference only. Do not use RAG, retrieval prior, a separate text Judge, review loop, or audio evidence.\n\n"
+    )
+    rag_rule = (
+        "2. Retrieved examples are training-set neighbors that help calibrate dataset label boundaries. They are not external fact proof, and you must not simply vote by example labels.\n"
+        if use_rag
+        else "2. No retrieved examples or priors are provided in this experiment; rely only on the current video and current sample text.\n"
+    )
     return (
-        "You are a short-video fake-news detector. Watch the current video directly and use the retrieved "
-        "training-set examples to classify the current sample as real or fake.\n\n"
-        "This is the E5 ablation: Qwen3-VL + RAG only. Do not use a separate text Judge, review loop, or audio evidence.\n\n"
+        "You are a short-video fake-news detector. Watch the current video directly and classify the current sample as real or fake.\n\n"
+        f"{mode_line}"
         "Decision principles:\n"
         "1. The event/description is the claim to verify; hashtags and user text are auxiliary context.\n"
-        "2. Retrieved examples are training-set neighbors that help calibrate dataset label boundaries. They are not external fact proof, and you must not simply vote by example labels.\n"
+        f"{rag_rule}"
         "3. Do not classify fake merely because the sampled video lacks full visual proof; short videos often show partial evidence.\n"
         "4. Strong fake cues include mismatch between video and claim, old/unrelated footage, captions/narration merely repeating a rumor, sensational framing, hoax/fabrication structure, or false context.\n"
         "5. If the video shows ordinary news/reporting/science/event footage with no clear contradiction, prefer real.\n\n"
         f"Current sample auxiliary text:\n{current_context}\n\n"
-        f"retrieved_train_examples_json: {json.dumps(examples, ensure_ascii=False)}\n\n"
+        f"{rag_block_en}"
         "Do not output JSON, markdown, or hidden reasoning. Return exactly 4 lines:\n"
         "LABEL: real or fake\n"
         "FAKE_SCORE: number_between_0_and_1\n"
@@ -1491,6 +1598,7 @@ def run_two_stage(
 
     ablation_config = two_stage.get("ablation", {})
     direct_vlm_rag = bool(ablation_config.get("direct_vlm_rag", False))
+    freeform_label_space = bool(ablation_config.get("freeform_label_space", False))
     text_model = None
     tokenizer = None
     if not direct_vlm_rag:
@@ -1527,6 +1635,7 @@ def run_two_stage(
         "use_retrieval_prior": use_retrieval_prior,
         "use_loop": use_loop,
         "direct_vlm_rag": direct_vlm_rag,
+        "freeform_label_space": freeform_label_space,
     }
     loop_config = two_stage.get("judge_loop", {})
     loop_enabled = bool(loop_config.get("enabled", True)) and use_loop
@@ -1610,7 +1719,13 @@ def run_two_stage(
                         processor,
                         video_frames,
                         model_video_metadata,
-                        _direct_vlm_rag_prompt(row, examples, dataset_name),
+                        _direct_vlm_rag_prompt(
+                            row,
+                            examples,
+                            dataset_name,
+                            use_rag=use_rag,
+                            freeform_label_space=freeform_label_space,
+                        ),
                         fps,
                         max_new_tokens=direct_vlm_tokens,
                         do_sample=False,
@@ -1848,7 +1963,14 @@ def run_two_stage(
                 judge_raw = _generate_text_only(
                     text_model,
                     tokenizer,
-                    _judge_prompt(row, visual, audio, examples, dataset_name),
+                    _judge_prompt(
+                        row,
+                        visual,
+                        audio,
+                        examples,
+                        dataset_name,
+                        freeform_label_space=freeform_label_space,
+                    ),
                     max_new_tokens=judge_tokens,
                     do_sample=False,
                 )
@@ -1870,7 +1992,17 @@ def run_two_stage(
                     final_raw = _generate_text_only(
                         text_model,
                         tokenizer,
-                        _judge_final_prompt(row, visual, audio, examples, initial_judge, review, retrieval_prior, dataset_name),
+                        _judge_final_prompt(
+                            row,
+                            visual,
+                            audio,
+                            examples,
+                            initial_judge,
+                            review,
+                            retrieval_prior,
+                            dataset_name,
+                            freeform_label_space=freeform_label_space,
+                        ),
                         max_new_tokens=final_tokens,
                         do_sample=False,
                     )
