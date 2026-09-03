@@ -1,4 +1,4 @@
-# AgentVideoMMD
+# TRACE
 
 ![AgentVideoMMD Case Study](assets/case_study.png)
 
