@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +20,18 @@ from .labels import normalize_prediction
 from .metrics import compute_metrics
 
 
+_UNRESOLVED_ENV_PATTERN = re.compile(r"(\$\{[^}]+\}|%[^%]+%)")
+
+
+def _expand_config_value(value: str | Path, field_name: str) -> str:
+    expanded = os.path.expandvars(str(value).strip())
+    if _UNRESOLVED_ENV_PATTERN.search(expanded):
+        raise ValueError(
+            f"Config field {field_name!r} still contains an unresolved environment variable: {value}"
+        )
+    return expanded
+
+
 def load_config(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -29,7 +43,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def resolve_path(repo_root: Path, value: str | Path) -> Path:
-    path = Path(value)
+    path = Path(_expand_config_value(value, "path"))
     return path if path.is_absolute() else repo_root / path
 
 
@@ -82,7 +96,7 @@ def load_model(config: dict[str, Any]):
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     model_config = config["model"]
-    model_path = str(model_config["path"])
+    model_path = _expand_config_value(model_config["path"], "model.path")
     attn_implementation = _normalize_attn_implementation(
         str(model_config.get("attn_implementation", "sdpa"))
     )
@@ -452,7 +466,7 @@ def run(
     manifest_path = resolve_path(repo_root, config["dataset"]["manifest"])
     prediction_path = resolve_path(repo_root, config["output"]["predictions"])
     metrics_path = resolve_path(repo_root, config["output"]["metrics"])
-    video_root = video_root_override or Path(config["dataset"]["video_root"])
+    video_root = video_root_override or resolve_path(repo_root, config["dataset"]["video_root"])
     rows = list(read_jsonl(manifest_path))
     if limit is not None:
         rows = rows[:limit]
@@ -526,7 +540,7 @@ def run(
         latest = {str(row["id"]): row for row in read_jsonl(prediction_path)}
         selected = [latest.get(str(row["id"])) for row in rows]
         return {
-            "mode": "smoke_test",
+            "mode": "partial_run",
             "requested": len(rows),
             "successful": sum(bool(row) and not row.get("error") for row in selected),
             "failed": sum(bool(row) and bool(row.get("error")) for row in selected),

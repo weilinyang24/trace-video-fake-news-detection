@@ -19,6 +19,7 @@ from .io import read_jsonl, write_json_atomic
 from .labels import normalize_prediction
 from .metrics import compute_metrics
 from .runner import (
+    _expand_config_value,
     _load_video_frames,
     _metadata_value,
     _normalize_attn_implementation,
@@ -391,7 +392,7 @@ def _load_text_model(config: dict[str, Any]):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_config = config.get("text_model", {})
-    model_path = str(model_config.get("path", "/data2/573ops_ser/models/Qwen3-8B"))
+    model_path = _expand_config_value(model_config["path"], "text_model.path")
     attn_implementation = _normalize_attn_implementation(str(model_config.get("attn_implementation", "sdpa")))
     print(
         json.dumps(
@@ -461,7 +462,7 @@ def _load_audio_model(config: dict[str, Any]):
         ) from exc
 
     audio_config = config.get("audio_model", {})
-    model_path = str(audio_config.get("path", "/data2/573ops_ser/models/Qwen2-Audio-7B-Instruct"))
+    model_path = _expand_config_value(audio_config["path"], "audio_model.path")
     attn_implementation = _normalize_attn_implementation(str(audio_config.get("attn_implementation", "sdpa")))
     print(
         json.dumps(
@@ -808,10 +809,10 @@ def _judge_final_prompt(
     review: dict[str, Any],
     retrieval_prior: dict[str, Any],
     dataset: str,
-    freeform_label_space: bool = False,
+    natural_language_output: bool = False,
 ) -> str:
     current_context = _current_context(row)
-    if freeform_label_space:
+    if natural_language_output:
         if dataset.lower() == "fakesv":
             return (
                 "你是中文短视频虚假新闻检测二阶段 loop 的最终裁决器。\n"
@@ -828,8 +829,8 @@ def _judge_final_prompt(
             )
         return (
             "You are the final arbiter in a lightweight judge loop for short-video fake-news detection.\n"
-            "This is a label-space-control ablation: all evidence components are available, but do not use the fixed `LABEL: real/fake` output format "
-            "and do not artificially bias toward either class for label balancing.\n"
+            "Answer in natural language instead of the fixed `LABEL: real/fake` output format. "
+            "Do not artificially bias toward either class.\n"
             "Answer freely in natural language whether the current video news is more credible/true or more false/misleading. "
             "Even if evidence is incomplete, state a clear leaning so the evaluator can parse it.\n\n"
             f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
@@ -1363,11 +1364,11 @@ def _judge_prompt(
     audio: dict[str, Any],
     examples: list[dict[str, Any]],
     dataset: str,
-    freeform_label_space: bool = False,
+    natural_language_output: bool = False,
 ) -> str:
     current_context = _current_context(row)
     retrieval_prior = _retrieval_prior(examples, _current_claim_text(row))
-    if freeform_label_space:
+    if natural_language_output:
         if dataset.lower() == "fakesv":
             return (
                 "你是中文短视频虚假新闻检测的校准裁决器。\n"
@@ -1383,8 +1384,8 @@ def _judge_prompt(
             )
         return (
             "You are a calibrated judge for short-video fake-news detection.\n"
-            "This is a label-space-control ablation: visual evidence, audio evidence, RAG examples, and retrieval prior are available, "
-            "but do not use the fixed `LABEL: real/fake` output format and do not artificially bias toward either class for label balancing.\n"
+            "Visual evidence, audio evidence, retrieved examples, and retrieval priors are available. "
+            "Answer in natural language instead of the fixed `LABEL: real/fake` output format, and do not artificially bias toward either class.\n"
             "Answer freely in natural language whether the current video news is more credible/true or more false/misleading. "
             "Even if evidence is incomplete, state a clear leaning so the evaluator can parse it.\n\n"
             f"retrieval_prior: {json.dumps(retrieval_prior, ensure_ascii=False)}\n\n"
@@ -1466,15 +1467,15 @@ def _judge_prompt(
     )
 
 
-def _direct_vlm_rag_prompt(
+def _direct_vlm_prompt(
     row: dict[str, Any],
     examples: list[dict[str, Any]],
     dataset: str,
     use_rag: bool = True,
-    freeform_label_space: bool = False,
+    natural_language_output: bool = False,
 ) -> str:
     current_context = _current_context(row)
-    if freeform_label_space:
+    if natural_language_output:
         if dataset.lower() == "fakesv":
             return (
                 "你是中文短视频新闻真实性分析助手。请直接观看当前视频，并阅读当前样本文本。\n"
@@ -1530,9 +1531,9 @@ def _direct_vlm_rag_prompt(
             "REASON: 一句中文理由"
         )
     mode_line = (
-        "This is the E5 ablation: Qwen3-VL + RAG examples only. Do not use a separate text Judge, review loop, or audio evidence.\n\n"
+        "Use the current video together with retrieved training examples as calibration context. Do not use a separate text judge, review loop, or audio evidence.\n\n"
         if use_rag
-        else "This is the E6 ablation: Qwen3-VL direct inference only. Do not use RAG, retrieval prior, a separate text Judge, review loop, or audio evidence.\n\n"
+        else "Use direct video inference only for the current sample. Do not use retrieved examples, retrieval priors, a separate text judge, review loop, or audio evidence.\n\n"
     )
     rag_rule = (
         "2. Retrieved examples are training-set neighbors that help calibrate dataset label boundaries. They are not external fact proof, and you must not simply vote by example labels.\n"
@@ -1575,7 +1576,7 @@ def run_two_stage(
     two_stage = config.get("two_stage", {})
     dataset_name = str(config["dataset"]["name"]).lower()
     manifest_path = resolve_path(repo_root, config["dataset"]["manifest"])
-    video_root = video_root_override or Path(config["dataset"]["video_root"])
+    video_root = video_root_override or resolve_path(repo_root, config["dataset"]["video_root"])
     prediction_value = two_stage.get("predictions")
     if prediction_value is None:
         prediction_value = str(config["output"]["predictions"]).replace(".jsonl", "_twostage.jsonl")
@@ -1596,13 +1597,7 @@ def run_two_stage(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    ablation_config = two_stage.get("ablation", {})
-    direct_vlm_rag = bool(ablation_config.get("direct_vlm_rag", False))
-    freeform_label_space = bool(ablation_config.get("freeform_label_space", False))
-    text_model = None
-    tokenizer = None
-    if not direct_vlm_rag:
-        text_model, tokenizer = _load_text_model(config)
+    text_model, tokenizer = _load_text_model(config)
     vlm = None
     processor = None
     audio_model = None
@@ -1614,7 +1609,6 @@ def run_two_stage(
     fallback_num_frames = int(config["video"].get("fallback_num_frames", 16))
     visual_tokens = int(two_stage.get("visual_max_new_tokens", 512))
     judge_tokens = int(two_stage.get("judge_max_new_tokens", 384))
-    direct_vlm_tokens = int(two_stage.get("direct_vlm_max_new_tokens", judge_tokens))
     per_label = int(two_stage.get("retrieval_per_label", 2))
     max_video_frames = int(two_stage.get("max_video_frames", 64))
     cache_config = two_stage.get("visual_cache", {})
@@ -1625,26 +1619,14 @@ def run_two_stage(
     )
     cache_schema_version = int(cache_config.get("schema_version", 1))
     refresh_visual_cache = bool(cache_config.get("refresh", False)) or refresh_visual_cache_override
-    use_audio_evidence = bool(ablation_config.get("use_audio", True))
-    use_rag = bool(ablation_config.get("use_rag", True))
-    use_retrieval_prior = bool(ablation_config.get("use_retrieval_prior", use_rag))
-    use_loop = bool(ablation_config.get("use_loop", True))
-    active_ablation = {
-        "use_audio": use_audio_evidence,
-        "use_rag": use_rag,
-        "use_retrieval_prior": use_retrieval_prior,
-        "use_loop": use_loop,
-        "direct_vlm_rag": direct_vlm_rag,
-        "freeform_label_space": freeform_label_space,
-    }
     loop_config = two_stage.get("judge_loop", {})
-    loop_enabled = bool(loop_config.get("enabled", True)) and use_loop
+    loop_enabled = bool(loop_config.get("enabled", True))
     review_tokens = int(loop_config.get("review_max_new_tokens", 256))
     final_tokens = int(loop_config.get("final_max_new_tokens", judge_tokens))
     visual_cache_hits = 0
     visual_cache_misses = 0
     audio_config = two_stage.get("audio_cache", {})
-    audio_enabled = bool(audio_config.get("enabled", False)) and use_audio_evidence
+    audio_enabled = bool(audio_config.get("enabled", False))
     audio_cache = (
         AudioEvidenceCache(resolve_path(repo_root, audio_config.get("path", "outputs/cache/audio_evidence.sqlite3")))
         if audio_enabled
@@ -1667,107 +1649,6 @@ def run_two_stage(
             result = {"id": sample_id, "label": row["label"], "video": row["video"]}
             try:
                 video_path = video_root / row["video"]
-                if direct_vlm_rag:
-                    if use_rag:
-                        examples = _load_dynamic_examples(
-                            repo_root,
-                            dataset_name,
-                            _current_context(row),
-                            per_label=per_label,
-                            seed=seed,
-                        )
-                    else:
-                        examples = []
-                    if vlm is None or processor is None:
-                        vlm, processor = load_model(config)
-                    video_frames, video_metadata, backend, decoder_errors = _load_video_frames(
-                        video_path,
-                        fps,
-                        decoder_backend,
-                        fallback_num_frames,
-                    )
-                    print(
-                        json.dumps(
-                            {
-                                "event": "decode_video",
-                                "video": row["video"],
-                                "backend": backend,
-                                "sampled_frames": len(video_frames),
-                                "total_frames": _metadata_value(video_metadata, "total_num_frames"),
-                                "fallback_errors": decoder_errors,
-                            },
-                            ensure_ascii=False,
-                        ),
-                        flush=True,
-                    )
-                    video_frames, model_video_metadata = _uniform_sample_video(video_frames, video_metadata, max_video_frames, fps)
-                    print(
-                        json.dumps(
-                            {
-                                "event": "sample_video_for_model",
-                                "video": row["video"],
-                                "model_frames": len(video_frames),
-                                "source_total_frames": _metadata_value(model_video_metadata, "source_total_num_frames"),
-                                "mode": "direct_vlm_rag",
-                            },
-                            ensure_ascii=False,
-                        ),
-                        flush=True,
-                    )
-                    direct_raw = _generate_text_with_video(
-                        vlm,
-                        processor,
-                        video_frames,
-                        model_video_metadata,
-                        _direct_vlm_rag_prompt(
-                            row,
-                            examples,
-                            dataset_name,
-                            use_rag=use_rag,
-                            freeform_label_space=freeform_label_space,
-                        ),
-                        fps,
-                        max_new_tokens=direct_vlm_tokens,
-                        do_sample=False,
-                    )
-                    judge = _judge_from_raw(direct_raw)
-                    prediction, parse_ok = normalize_prediction(str(judge.get("prediction", "")))
-                    result.update(
-                        {
-                            "prediction": prediction,
-                            "parse_ok": parse_ok,
-                            "fake_score": judge.get("fake_score"),
-                            "confidence": judge.get("confidence"),
-                            "key_factors": judge.get("key_factors", []),
-                            "rationale": judge.get("rationale", ""),
-                            "retrieved_examples": examples,
-                            "ablation": active_ablation,
-                            "judge_raw": direct_raw,
-                            "direct_vlm_rag_raw": direct_raw,
-                            "judge_loop_enabled": False,
-                            "visual_cache_hit": False,
-                            "audio_cache_hit": False,
-                            "error": None,
-                        }
-                    )
-                    result["elapsed_seconds"] = round(time.perf_counter() - started, 4)
-                    output.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    output.flush()
-                    print(
-                        json.dumps(
-                            {
-                                "index": index,
-                                **{
-                                    k: v
-                                    for k, v in result.items()
-                                    if k not in {"judge_raw", "retrieved_examples", "direct_vlm_rag_raw"}
-                                },
-                            },
-                            ensure_ascii=False,
-                        ),
-                        flush=True,
-                    )
-                    continue
                 visual_prompt = _visual_prompt(row, dataset_name)
                 cache_key, cache_identity = _visual_cache_key(
                     dataset=dataset_name,
@@ -1869,13 +1750,12 @@ def run_two_stage(
                     sample_rate=audio_sample_rate,
                 )
                 cached_audio = None if refresh_audio_cache or audio_cache is None else audio_cache.get(audio_key)
-                if not use_audio_evidence:
+                if not audio_enabled:
                     audio_raw = ""
                     audio = {
                         "audio_available": False,
-                        "audio_disabled_by_ablation": True,
                         "decision_relevance": "low",
-                        "summary": "Audio evidence was disabled by the ablation configuration.",
+                        "summary": "Audio evidence is disabled in the current configuration.",
                     }
                 elif cached_audio is not None:
                     audio_cache_hits += 1
@@ -1937,29 +1817,15 @@ def run_two_stage(
                         "decision_relevance": "low",
                         "summary": "Audio evidence was not available for this judge run.",
                     }
-                if use_rag:
-                    examples = _load_dynamic_examples(
-                        repo_root,
-                        dataset_name,
-                        _current_context(row),
-                        per_label=per_label,
-                        seed=seed,
-                    )
-                    retrieval_prior = _retrieval_prior(examples, _current_claim_text(row))
-                else:
-                    examples = []
-                    retrieval_prior = {
-                        "prior": "neutral",
-                        "strength": 0.0,
-                        "reason": "rag_disabled_by_ablation",
-                        "top_real_similarity": 0.0,
-                        "top_fake_similarity": 0.0,
-                        "same_claim_real": 0,
-                        "same_claim_fake": 0,
-                        "margin": 0.0,
-                        "hard_override_allowed": False,
-                    }
-                calibration_prior = retrieval_prior if use_rag else None
+                examples = _load_dynamic_examples(
+                    repo_root,
+                    dataset_name,
+                    _current_context(row),
+                    per_label=per_label,
+                    seed=seed,
+                )
+                retrieval_prior = _retrieval_prior(examples, _current_claim_text(row))
+                calibration_prior = retrieval_prior
                 judge_raw = _generate_text_only(
                     text_model,
                     tokenizer,
@@ -1969,7 +1835,6 @@ def run_two_stage(
                         audio,
                         examples,
                         dataset_name,
-                        freeform_label_space=freeform_label_space,
                     ),
                     max_new_tokens=judge_tokens,
                     do_sample=False,
@@ -2001,7 +1866,6 @@ def run_two_stage(
                             review,
                             retrieval_prior,
                             dataset_name,
-                            freeform_label_space=freeform_label_space,
                         ),
                         max_new_tokens=final_tokens,
                         do_sample=False,
@@ -2028,7 +1892,6 @@ def run_two_stage(
                         "audio_evidence": audio,
                         "retrieved_examples": examples,
                         "retrieval_prior": retrieval_prior,
-                        "ablation": active_ablation,
                         "visual_raw": visual_raw,
                         "judge_raw": judge_raw,
                         "judge_loop_enabled": loop_enabled,
@@ -2064,7 +1927,7 @@ def run_two_stage(
 
     if limit is not None:
         return {
-            "mode": "smoke_test",
+            "mode": "partial_run",
             "requested": len(rows),
             "predictions": str(prediction_path),
             "metrics_written": False,
@@ -2073,7 +1936,6 @@ def run_two_stage(
             "audio_cache_hits": audio_cache_hits,
             "audio_cache_misses": audio_cache_misses,
             "judge_loop_enabled": loop_enabled,
-            "ablation": active_ablation,
         }
     metrics = evaluate_prediction_file(prediction_path)
     metrics["visual_cache_hits"] = visual_cache_hits
@@ -2081,7 +1943,6 @@ def run_two_stage(
     metrics["audio_cache_hits"] = audio_cache_hits
     metrics["audio_cache_misses"] = audio_cache_misses
     metrics["judge_loop_enabled"] = loop_enabled
-    metrics["ablation"] = active_ablation
     write_json_atomic(metrics_path, metrics)
     return metrics
 
@@ -2102,7 +1963,7 @@ def build_evidence_cache(
     two_stage = config.get("two_stage", {})
     dataset_name = str(config["dataset"]["name"]).lower()
     manifest_path = resolve_path(repo_root, config["dataset"]["manifest"])
-    video_root = video_root_override or Path(config["dataset"]["video_root"])
+    video_root = video_root_override or resolve_path(repo_root, config["dataset"]["video_root"])
     rows = list(read_jsonl(manifest_path))
     if limit is not None:
         rows = rows[:limit]
