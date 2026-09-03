@@ -103,9 +103,4 @@ A complete qualitative case study is included in the repository:
 
 The case study illustrates the multimodal evidence and reasoning process used by trace for short-video fake news detection.
 
-## Notes
 
-* Video files are intentionally **not tracked** in this repository.
-* Local model and dataset paths should be provided through environment variables.
-* Do **not** commit machine-specific absolute paths into the tracked YAML configuration files.
-* Strict evaluation metrics are written only when all latest predictions are valid and successfully parsed.
