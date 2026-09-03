@@ -36,12 +36,12 @@ To keep the repository portable, tracked configuration files do **not** contain 
 Before running inference, configure the paths to your local models and datasets using environment variables:
 
 ```powershell
-$env:trace_VLM_PATH = "D:\\path\\to\\Qwen3-VL-30B-Instruct"
-$env:trace_TEXT_MODEL_PATH = "D:\\path\\to\\Qwen3-8B"
-$env:trace_AUDIO_MODEL_PATH = "D:\\path\\to\\Qwen2-Audio-7B-Instruct"
+$env:trace_VLM_PATH = "\\path\\to\\Qwen3-VL-30B-Instruct"
+$env:trace_TEXT_MODEL_PATH = "\\path\\to\\Qwen3-8B"
+$env:trace_AUDIO_MODEL_PATH = "\\path\\to\\Qwen2-Audio-7B-Instruct"
 
-$env:trace_FAKETT_VIDEO_ROOT = "D:\\path\\to\\FakeTT\\video"
-$env:trace_FAKESV_VIDEO_ROOT = "D:\\path\\to\\FakeSV\\video\\videos"
+$env:trace_FAKETT_VIDEO_ROOT = "\\path\\to\\FakeTT\\video"
+$env:trace_FAKESV_VIDEO_ROOT = "\\path\\to\\FakeSV\\video\\videos"
 ```
 
 The default public configuration files are:
